@@ -17,9 +17,27 @@
 package org.apache.spark.sql.snowflake.extensions.analyzer.extension
 
 import org.apache.spark.sql.catalyst.analysis.UnresolvedRelation
-import org.scalatest.FunSuite
+import org.apache.spark.sql.connector.catalog.Identifier
+import org.apache.spark.sql.SparkSession
+import org.scalatest.{BeforeAndAfterEach, FunSuite}
 
-class ResolveSnowflakeRelationsTest extends FunSuite {
+class ResolveSnowflakeRelationsTest extends FunSuite with BeforeAndAfterEach {
+  
+  var spark: SparkSession = _
+  
+  override def beforeEach(): Unit = {
+    spark = SparkSession.builder()
+      .master("local[1]")
+      .appName("ResolveSnowflakeRelationsTest")
+      .getOrCreate()
+  }
+  
+  override def afterEach(): Unit = {
+    if (spark != null) {
+      spark.stop()
+      spark = null
+    }
+  }
 
   private val configKey = "spark.snowflake.extensions.fgacJdbcFallback.enabled"
 
@@ -117,5 +135,131 @@ class ResolveSnowflakeRelationsTest extends FunSuite {
     assert(clazz != null, "FGACForbiddenException class should exist")
     assert(classOf[org.apache.spark.sql.catalyst.analysis.NoSuchTableException].isAssignableFrom(clazz),
       "FGACForbiddenException should extend NoSuchTableException")
+  }
+  
+  test("buildSnowflakeOptions should accept Identifier parameter") {
+    val clazz = classOf[ResolveSnowflakeRelations]
+    val methods = clazz.getDeclaredMethods
+    val buildOptionsMethod = methods.find(_.getName == "buildSnowflakeOptions")
+    
+    assert(buildOptionsMethod.isDefined, "buildSnowflakeOptions method should exist")
+    
+    val paramTypes = buildOptionsMethod.get.getParameterTypes
+    assert(paramTypes.length == 1, "buildSnowflakeOptions should take 1 parameter")
+    assert(paramTypes(0) == classOf[Identifier], 
+      "buildSnowflakeOptions should accept Identifier parameter")
+  }
+  
+  test("createSnowflakeRelation should accept Identifier parameter") {
+    val clazz = classOf[ResolveSnowflakeRelations]
+    val methods = clazz.getDeclaredMethods
+    val createRelationMethod = methods.find(_.getName == "createSnowflakeRelation")
+    
+    assert(createRelationMethod.isDefined, "createSnowflakeRelation method should exist")
+    
+    val paramTypes = createRelationMethod.get.getParameterTypes
+    assert(paramTypes.length == 1, "createSnowflakeRelation should take 1 parameter")
+    assert(paramTypes(0) == classOf[Identifier], 
+      "createSnowflakeRelation should accept Identifier parameter")
+  }
+  
+  test("buildSnowflakeOptions should handle table without namespace") {
+    spark.conf.set("spark.snowflake.sfURL", "account.snowflakecomputing.com")
+    spark.conf.set("spark.snowflake.sfUser", "testuser")
+    
+    val rule = ResolveSnowflakeRelations(spark)
+    val buildOptionsMethod = classOf[ResolveSnowflakeRelations]
+      .getDeclaredMethod("buildSnowflakeOptions", classOf[Identifier])
+    buildOptionsMethod.setAccessible(true)
+    
+    val ident = Identifier.of(Array.empty[String], "mytable")
+    val options = buildOptionsMethod.invoke(rule, ident).asInstanceOf[Map[String, String]]
+    
+    assert(options("dbtable") == "mytable", "Should use just table name")
+    assert(options.contains("sfURL"), "Should include SparkConf settings")
+    assert(options("sfURL") == "account.snowflakecomputing.com")
+  }
+  
+  test("buildSnowflakeOptions should handle table with single namespace (schema)") {
+    spark.conf.set("spark.snowflake.sfURL", "account.snowflakecomputing.com")
+    
+    val rule = ResolveSnowflakeRelations(spark)
+    val buildOptionsMethod = classOf[ResolveSnowflakeRelations]
+      .getDeclaredMethod("buildSnowflakeOptions", classOf[Identifier])
+    buildOptionsMethod.setAccessible(true)
+    
+    val ident = Identifier.of(Array("myschema"), "mytable")
+    val options = buildOptionsMethod.invoke(rule, ident).asInstanceOf[Map[String, String]]
+    
+    assert(options("dbtable") == "myschema.mytable", 
+      "Should use schema.table format")
+  }
+  
+  test("buildSnowflakeOptions should handle table with multi-level namespace (db.schema)") {
+    spark.conf.set("spark.snowflake.sfURL", "account.snowflakecomputing.com")
+    
+    val rule = ResolveSnowflakeRelations(spark)
+    val buildOptionsMethod = classOf[ResolveSnowflakeRelations]
+      .getDeclaredMethod("buildSnowflakeOptions", classOf[Identifier])
+    buildOptionsMethod.setAccessible(true)
+    
+    val ident = Identifier.of(Array("mydb", "myschema"), "mytable")
+    val options = buildOptionsMethod.invoke(rule, ident).asInstanceOf[Map[String, String]]
+    
+    assert(options("dbtable") == "mydb.myschema.mytable", 
+      "Should use db.schema.table format")
+  }
+  
+  test("buildSnowflakeOptions should merge configs from all sources") {
+    spark.sparkContext.getConf.set("spark.snowflake.sfURL", "from-sparkcontext.snowflakecomputing.com")
+    spark.conf.set("spark.snowflake.sfUser", "from-runtimeconfig")
+    spark.sessionState.conf.setConfString("spark.snowflake.sfPassword", "from-sessionstate")
+    
+    val rule = ResolveSnowflakeRelations(spark)
+    val buildOptionsMethod = classOf[ResolveSnowflakeRelations]
+      .getDeclaredMethod("buildSnowflakeOptions", classOf[Identifier])
+    buildOptionsMethod.setAccessible(true)
+    
+    val ident = Identifier.of(Array("myschema"), "mytable")
+    val options = buildOptionsMethod.invoke(rule, ident).asInstanceOf[Map[String, String]]
+    
+    assert(options.contains("sfURL"), "Should include config from SparkContext")
+    assert(options.contains("sfUser"), "Should include config from RuntimeConfig")
+    assert(options.contains("sfPassword"), "Should include config from SessionState")
+  }
+  
+  test("buildSnowflakeOptions should give precedence to SessionState configs") {
+    spark.sparkContext.getConf.set("spark.snowflake.sfURL", "from-sparkcontext.snowflakecomputing.com")
+    spark.conf.set("spark.snowflake.sfURL", "from-runtimeconfig.snowflakecomputing.com")
+    spark.sessionState.conf.setConfString("spark.snowflake.sfURL", "from-sessionstate.snowflakecomputing.com")
+    
+    val rule = ResolveSnowflakeRelations(spark)
+    val buildOptionsMethod = classOf[ResolveSnowflakeRelations]
+      .getDeclaredMethod("buildSnowflakeOptions", classOf[Identifier])
+    buildOptionsMethod.setAccessible(true)
+    
+    val ident = Identifier.of(Array("myschema"), "mytable")
+    val options = buildOptionsMethod.invoke(rule, ident).asInstanceOf[Map[String, String]]
+    
+    assert(options("sfURL") == "from-sessionstate.snowflakecomputing.com", 
+      "SessionState config should take precedence")
+  }
+  
+  test("buildSnowflakeOptions should strip spark.snowflake prefix") {
+    spark.conf.set("spark.snowflake.sfURL", "account.snowflakecomputing.com")
+    spark.conf.set("snowflake.sfUser", "testuser")
+    
+    val rule = ResolveSnowflakeRelations(spark)
+    val buildOptionsMethod = classOf[ResolveSnowflakeRelations]
+      .getDeclaredMethod("buildSnowflakeOptions", classOf[Identifier])
+    buildOptionsMethod.setAccessible(true)
+    
+    val ident = Identifier.of(Array("myschema"), "mytable")
+    val options = buildOptionsMethod.invoke(rule, ident).asInstanceOf[Map[String, String]]
+    
+    assert(options.contains("sfURL"), "Should strip spark.snowflake prefix")
+    assert(!options.contains("spark.snowflake.sfURL"), "Should not contain prefixed key")
+    assert(options.contains("sfUser"), "Should strip snowflake prefix")
+    assert(!options.contains("snowflake.sfUser"), "Should not contain prefixed key")
   }
 }
