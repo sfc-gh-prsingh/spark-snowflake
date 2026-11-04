@@ -28,6 +28,9 @@ class SnowflakeFallbackCatalogIcebergTest extends AnyFunSuite with BeforeAndAfte
 
   override def beforeAll(): Unit = {
     val warehouse = Files.createTempDirectory("fallback-iceberg").toUri.toString
+    // spark.sql.extensions is static: stop any session leaked by an earlier suite in this JVM
+    SparkSession.getActiveSession.foreach(_.stop())
+    SparkSession.getDefaultSession.foreach(_.stop())
     spark = SparkSession.builder()
       .master("local[1]")
       .config("spark.ui.enabled", "false")
