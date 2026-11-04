@@ -170,7 +170,10 @@ lazy val root = project.withId("spark-snowflake").in(file("."))
           classifier "test-sources",
         "org.apache.spark" %% "spark-catalyst" % sv % "provided, test"
           classifier "test-sources",
-        "org.apache.parquet" % "parquet-avro" % parquetAvroVersion
+        "org.apache.parquet" % "parquet-avro" % parquetAvroVersion,
+        // SnowflakeFallbackCatalog branch/tag DDL and procedures are planned via Iceberg
+        "org.apache.iceberg" %% s"iceberg-spark-runtime-${sparkMajorMinor(sv)}" % "1.11.0" %
+          "provided, test"
       ) ++ (
         if (sv >= "4.0.0") Seq(
           "org.apache.spark" %% "spark-sql-api" % sv % "provided, test"
