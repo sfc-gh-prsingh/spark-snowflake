@@ -15,10 +15,11 @@
  */
 package org.apache.spark.sql.snowflake.catalog
 
-import net.snowflake.spark.snowflake.{Parameters, Utils}
+import net.snowflake.spark.snowflake.{IcebergTimeTravel, Parameters, Utils}
 import org.apache.spark.SPARK_VERSION
 import org.apache.spark.sql.catalyst.catalog.{BucketSpec, CatalogStorageFormat, CatalogTable, CatalogTableType}
-import org.apache.spark.sql.catalyst.TableIdentifier
+import org.apache.spark.sql.catalyst.{QualifiedTableName, TableIdentifier}
+import org.apache.spark.sql.catalyst.analysis.NoSuchTableException
 import org.apache.spark.sql.connector.catalog._
 import org.apache.spark.sql.connector.catalog.V1Table
 import org.apache.spark.sql.connector.expressions.Transform
@@ -29,8 +30,22 @@ import org.slf4j.LoggerFactory
 import scala.collection.JavaConverters._
 import scala.reflect.runtime.{universe => ru}
 
+private object SnowflakeFallbackCatalog {
+  // Iceberg SparkCatalog's snapshot selectors in the table name
+  val SnapshotIdSelector = "snapshot_id_(\\d+)".r
+  val AtTimestampSelector = "at_timestamp_(\\d+)".r
+  val BranchSelector = "branch_(.+)".r
+  val TagSelector = "tag_(.+)".r
+  // Iceberg MetadataTableType names, listed here to keep Iceberg off the 4.x runtime classpath
+  val IcebergMetadataTables = Set("entries", "files", "data_files", "delete_files", "history",
+    "metadata_log_entries", "snapshots", "refs", "manifests", "partitions", "all_data_files",
+    "all_delete_files", "all_files", "all_manifests", "all_entries", "position_deletes")
+}
+
 class SnowflakeFallbackCatalog extends CatalogExtension with SupportsNamespaces
     with FallbackProcedureSupport {
+
+  import SnowflakeFallbackCatalog._
 
   private val log = LoggerFactory.getLogger(getClass)
   private var delegateCatalog: CatalogPlugin = _
@@ -177,26 +192,91 @@ class SnowflakeFallbackCatalog extends CatalogExtension with SupportsNamespaces
     } catch {
       case ex: Throwable =>
         if (isForbiddenException(ex)) {
-          log.info(s"403 Forbidden detected for ${ident}, attempting JDBC fallback")
-          try {
-            createSnowflakeV1Table(ident)
-          } catch {
-            case fallbackEx: Throwable =>
-              // rethrow original exception if fallback also fails
-              log.error(s"Failed to create V1Table fallback for ${ident}", fallbackEx)
-              throw ex
-          }
+          if (isMetadataTableOfProtected(ident)) throw ex
+          fallbackToSnowflake(ident, None, ex)
+        } else if (ex.isInstanceOf[NoSuchTableException]) {
+          loadProtectedSelector(ident).getOrElse(throw ex)
         } else {
           throw ex
         }
     }
   }
-  
+
   override def loadTable(ident: Identifier, version: String): Table =
-    tableCatalog.loadTable(ident, version)
+    loadTimeTravel(ident, IcebergTimeTravel.fromVersion(version)) {
+      tableCatalog.loadTable(ident, version)
+    }
 
   override def loadTable(ident: Identifier, timestamp: Long): Table =
-    tableCatalog.loadTable(ident, timestamp)
+    loadTimeTravel(ident, IcebergTimeTravel.TimestampMicros(timestamp)) {
+      tableCatalog.loadTable(ident, timestamp)
+    }
+
+  private def loadTimeTravel(ident: Identifier, spec: IcebergTimeTravel.Spec)(
+      load: => Table): Table = {
+    try {
+      load
+    } catch {
+      case ex: Throwable if isForbiddenException(ex) => fallbackToSnowflake(ident, Some(spec), ex)
+    }
+  }
+
+  private def fallbackToSnowflake(
+      ident: Identifier, spec: Option[IcebergTimeTravel.Spec], original: Throwable): Table = {
+    log.info(s"403 Forbidden detected for ${ident}, attempting JDBC fallback")
+    try {
+      createSnowflakeV1Table(ident, spec)
+    } catch {
+      case fallbackEx: Throwable =>
+        // rethrow original exception if fallback also fails
+        log.error(s"Failed to create V1Table fallback for ${ident}", fallbackEx)
+        throw original
+    }
+  }
+
+  /**
+   * Iceberg's REST client also returns the base table's 403 for its metadata tables (db.t.refs);
+   * Snowflake has no equivalent, so they must not fall back to a table named db.t.refs.
+   */
+  private def isMetadataTableOfProtected(ident: Identifier): Boolean =
+    ident.namespace().nonEmpty &&
+      IcebergMetadataTables.contains(ident.name().toLowerCase(java.util.Locale.ROOT)) && {
+        val parent = Identifier.of(ident.namespace().init, ident.namespace().last)
+        try {
+          tableCatalog.loadTable(parent)
+          false
+        } catch {
+          case ex: Throwable => isForbiddenException(ex)
+        }
+      }
+
+  /**
+   * Iceberg's SparkCatalog reports a selector (db.t.branch_x, tag_x, snapshot_id_N,
+   * at_timestamp_N) of a 403 table as not found, so check the parent table for a 403.
+   */
+  private def loadProtectedSelector(ident: Identifier): Option[Table] = {
+    if (ident.namespace().isEmpty) {
+      return None
+    }
+    val spec: Option[IcebergTimeTravel.Spec] = ident.name() match {
+      case SnapshotIdSelector(id) => Some(IcebergTimeTravel.Snapshot(id.toLong))
+      case AtTimestampSelector(ms) => Some(IcebergTimeTravel.TimestampMicros(ms.toLong * 1000L))
+      case BranchSelector(ref) => Some(IcebergTimeTravel.Ref(ref))
+      case TagSelector(ref) => Some(IcebergTimeTravel.Ref(ref))
+      case _ => None
+    }
+    spec.flatMap { s =>
+      val parent = Identifier.of(ident.namespace().init, ident.namespace().last)
+      try {
+        tableCatalog.loadTable(parent)
+        None
+      } catch {
+        case ex: Throwable if isForbiddenException(ex) =>
+          Some(fallbackToSnowflake(parent, Some(s), ex))
+        case _: Throwable => None
+      }
+    }
+  }
 
   private def isForbiddenException(ex: Throwable): Boolean = {
     val exceptionClass = ex.getClass.getName
@@ -344,14 +424,19 @@ class SnowflakeFallbackCatalog extends CatalogExtension with SupportsNamespaces
     }
   }
   
-  private def createSnowflakeV1Table(ident: Identifier): Table = {
+  private def createSnowflakeV1Table(
+      ident: Identifier, timeTravel: Option[IcebergTimeTravel.Spec] = None): Table = {
     val namespace = if (ident.namespace().nonEmpty) Some(ident.namespace().mkString(".")) else None
+
+    // Spark caches the relation per (identifier catalog, database, table), ignoring read
+    // options; key each time travel spec separately. The SQL alias doesn't use this catalog.
+    val cacheCatalog = timeTravel.fold(catalogName)(spec => s"$catalogName ${spec.clause}")
 
     // TableIdentifier enforces: catalog.isEmpty || database.isDefined (Spark 3.5+ / 4.x).
     // Only set catalog when we have a database/namespace qualifier.
     val tableIdentifier = namespace match {
       case Some(db) =>
-        TableIdentifier(table = ident.name(), database = Some(db), catalog = Some(catalogName))
+        TableIdentifier(table = ident.name(), database = Some(db), catalog = Some(cacheCatalog))
       case None =>
         TableIdentifier(table = ident.name(), database = None, catalog = None)
     }
@@ -360,6 +445,15 @@ class SnowflakeFallbackCatalog extends CatalogExtension with SupportsNamespaces
     val spark = org.apache.spark.sql.SparkSession.getActiveSession.getOrElse(
       throw new IllegalStateException("No active SparkSession found")
     )
+
+    // Read options (snapshot-id, branch, ...) are applied when the relation is created, so drop
+    // a relation cached by an earlier read of this table
+    if (timeTravel.isEmpty) {
+      namespace.foreach { db =>
+        spark.sessionState.catalog.invalidateCachedTable(
+          QualifiedTableName(catalogName, db, ident.name()))
+      }
+    }
 
     val allConfs =
       spark.sparkContext.getConf.getAll.toMap  // Hardening: use ONLY immutable SparkConf; spark.conf/sessionState.conf are runtime SQLConf settable via SET and must not feed privileged connector options  // Hardening: sessionState.conf removed — it is user-mutable via SET and must not be merged into privileged connector options
@@ -392,7 +486,9 @@ class SnowflakeFallbackCatalog extends CatalogExtension with SupportsNamespaces
       serde = None,
       compressed = false,
       properties = database.map(Parameters.PARAM_SF_DATABASE -> _).toMap ++
-        snowflakeProps + ("dbtable" -> fullTableName)
+        snowflakeProps + (Parameters.PARAM_ICEBERG_FALLBACK -> "true") +
+        timeTravel.fold(Parameters.PARAM_SF_DBTABLE -> fullTableName)(spec =>
+          Parameters.PARAM_SF_QUERY -> IcebergTimeTravel.query(fullTableName, spec))
     )
 
     // Use reflection-based creation to ensure compatibility across Spark versions

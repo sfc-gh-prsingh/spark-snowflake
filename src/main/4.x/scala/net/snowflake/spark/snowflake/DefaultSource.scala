@@ -50,7 +50,8 @@ class DefaultSource(jdbcWrapper: JDBCWrapper)
   override def createRelation(sqlContext: SQLContext,
                               parameters: Map[String, String]): BaseRelation = {
     ensureConnectorOptionsRedacted(sqlContext.sparkSession)
-    val params = Parameters.mergeParameters(parameters)
+    val params =
+      Parameters.mergeParameters(IcebergTimeTravel.rewriteReadParameters(parameters))
     SnowflakeRelation(jdbcWrapper, params, None)(sqlContext)
   }
 
@@ -61,7 +62,8 @@ class DefaultSource(jdbcWrapper: JDBCWrapper)
                               parameters: Map[String, String],
                               schema: StructType): BaseRelation = {
     ensureConnectorOptionsRedacted(sqlContext.sparkSession)
-    val params = Parameters.mergeParameters(parameters)
+    val params =
+      Parameters.mergeParameters(IcebergTimeTravel.rewriteReadParameters(parameters))
     SnowflakeRelation(jdbcWrapper, params, Some(schema))(sqlContext)
   }
 
