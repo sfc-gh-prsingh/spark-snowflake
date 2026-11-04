@@ -29,7 +29,8 @@ import org.slf4j.LoggerFactory
 import scala.collection.JavaConverters._
 import scala.reflect.runtime.{universe => ru}
 
-class SnowflakeFallbackCatalog extends CatalogExtension with SupportsNamespaces {
+class SnowflakeFallbackCatalog extends CatalogExtension with SupportsNamespaces
+    with FallbackProcedureSupport {
 
   private val log = LoggerFactory.getLogger(getClass)
   private var delegateCatalog: CatalogPlugin = _
@@ -166,6 +167,10 @@ class SnowflakeFallbackCatalog extends CatalogExtension with SupportsNamespaces 
 
   override def name(): String = catalogName
 
+  override protected def procedureDelegate: CatalogPlugin = delegateCatalog
+
+  private[snowflake] def delegateTableCatalog: TableCatalog = tableCatalog
+
   override def loadTable(ident: Identifier): Table = {
     try {
       tableCatalog.loadTable(ident)
@@ -187,6 +192,12 @@ class SnowflakeFallbackCatalog extends CatalogExtension with SupportsNamespaces 
     }
   }
   
+  override def loadTable(ident: Identifier, version: String): Table =
+    tableCatalog.loadTable(ident, version)
+
+  override def loadTable(ident: Identifier, timestamp: Long): Table =
+    tableCatalog.loadTable(ident, timestamp)
+
   private def isForbiddenException(ex: Throwable): Boolean = {
     val exceptionClass = ex.getClass.getName
     val message = if (ex.getMessage != null) ex.getMessage else ""
