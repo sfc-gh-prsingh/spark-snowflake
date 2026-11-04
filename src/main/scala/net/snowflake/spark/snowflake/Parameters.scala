@@ -59,6 +59,8 @@ object Parameters {
   val PARAM_TEMPDIR: String = knownParam("tempdir")
   val PARAM_SF_DBTABLE: String = knownParam("dbtable")
   val PARAM_SF_QUERY: String = knownParam("query")
+  // Set by SnowflakeFallbackCatalog on its 403 fallback tables; see IcebergTimeTravel
+  val PARAM_ICEBERG_FALLBACK: String = knownParam("snowflake_iceberg_fallback")
   val PARAM_SF_TIMEZONE: String = knownParam("sftimezone")
   val PARAM_SF_WAREHOUSE: String = knownParam("sfwarehouse")
   val PARAM_TEMP_KEY_ID: String = knownParam("temporary_aws_access_key_id")

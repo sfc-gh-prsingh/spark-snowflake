@@ -69,6 +69,8 @@ private[snowflake] case class SnowflakeRelation(
   }
 
   override def insert(data: DataFrame, overwrite: Boolean): Unit = {
+    IcebergTimeTravel.checkWrite(
+      params, sqlContext.sparkSession.conf.getOption("spark.wap.branch"))
     val saveMode = if (overwrite) {
       SaveMode.Overwrite
     } else {
