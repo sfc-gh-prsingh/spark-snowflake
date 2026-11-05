@@ -99,6 +99,15 @@ class SnowflakeFallbackCatalogTimeTravelTest extends AnyFunSuite with BeforeAndA
       "SELECT * FROM MYDB.db.secret AT(VERSION_REF => 'x')")
   }
 
+  test("VERSION AS OF 'main' and branch_main fall back to the current table") {
+    for (table <- Seq(catalog().loadTable(secret, "main"),
+        catalog().loadTable(Identifier.of(Array("db", "secret"), "branch_main")))) {
+      val props = snowflakeTable(table).catalogTable.storage.properties
+      assert(props.get("dbtable").contains("MYDB.db.secret"))
+      assert(!props.contains("query"))
+    }
+  }
+
   test("TIMESTAMP AS OF falls back with AT(TIMESTAMP) in microseconds") {
     assert(queryOf(catalog().loadTable(secret, 1764547200000000L)) ==
       "SELECT * FROM MYDB.db.secret AT(TIMESTAMP => TO_TIMESTAMP_LTZ(1764547200000000, 6))")

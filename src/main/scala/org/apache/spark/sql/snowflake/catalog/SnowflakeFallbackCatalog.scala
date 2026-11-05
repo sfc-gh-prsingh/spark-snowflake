@@ -208,16 +208,17 @@ class SnowflakeFallbackCatalog extends CatalogExtension with SupportsNamespaces
     }
 
   override def loadTable(ident: Identifier, timestamp: Long): Table =
-    loadTimeTravel(ident, IcebergTimeTravel.TimestampMicros(timestamp)) {
+    loadTimeTravel(ident, Some(IcebergTimeTravel.TimestampMicros(timestamp))) {
       tableCatalog.loadTable(ident, timestamp)
     }
 
-  private def loadTimeTravel(ident: Identifier, spec: IcebergTimeTravel.Spec)(
+  /** spec None reads the current table (VERSION AS OF 'main'). */
+  private def loadTimeTravel(ident: Identifier, spec: Option[IcebergTimeTravel.Spec])(
       load: => Table): Table = {
     try {
       load
     } catch {
-      case ex: Throwable if isForbiddenException(ex) => fallbackToSnowflake(ident, Some(spec), ex)
+      case ex: Throwable if isForbiddenException(ex) => fallbackToSnowflake(ident, spec, ex)
     }
   }
 
@@ -258,21 +259,23 @@ class SnowflakeFallbackCatalog extends CatalogExtension with SupportsNamespaces
     if (ident.namespace().isEmpty) {
       return None
     }
-    val spec: Option[IcebergTimeTravel.Spec] = ident.name() match {
-      case SnapshotIdSelector(id) => Some(IcebergTimeTravel.Snapshot(id.toLong))
-      case AtTimestampSelector(ms) => Some(IcebergTimeTravel.TimestampMicros(ms.toLong * 1000L))
-      case BranchSelector(ref) => Some(IcebergTimeTravel.Ref(ref))
-      case TagSelector(ref) => Some(IcebergTimeTravel.Ref(ref))
+    // Outer None: not a selector; inner None: branch_main, the current table
+    val selector: Option[Option[IcebergTimeTravel.Spec]] = ident.name() match {
+      case SnapshotIdSelector(id) => Some(Some(IcebergTimeTravel.Snapshot(id.toLong)))
+      case AtTimestampSelector(ms) =>
+        Some(Some(IcebergTimeTravel.TimestampMicros(ms.toLong * 1000L)))
+      case BranchSelector(ref) => Some(IcebergTimeTravel.fromRef(ref))
+      case TagSelector(ref) => Some(Some(IcebergTimeTravel.Ref(ref)))
       case _ => None
     }
-    spec.flatMap { s =>
+    selector.flatMap { spec =>
       val parent = Identifier.of(ident.namespace().init, ident.namespace().last)
       try {
         tableCatalog.loadTable(parent)
         None
       } catch {
         case ex: Throwable if isForbiddenException(ex) =>
-          Some(fallbackToSnowflake(parent, Some(s), ex))
+          Some(fallbackToSnowflake(parent, spec, ex))
         case _: Throwable => None
       }
     }

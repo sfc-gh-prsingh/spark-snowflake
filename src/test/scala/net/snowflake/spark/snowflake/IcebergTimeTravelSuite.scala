@@ -79,9 +79,22 @@ class IcebergTimeTravelSuite extends AnyFunSuite with BeforeAndAfterAll {
   }
 
   test("VERSION AS OF picks a snapshot ID only for numeric versions") {
-    assert(IcebergTimeTravel.fromVersion("42") == Snapshot(42L))
-    assert(IcebergTimeTravel.fromVersion("v42") == Ref("v42"))
-    assert(IcebergTimeTravel.fromVersion("") == Ref(""))
+    assert(IcebergTimeTravel.fromVersion("42").contains(Snapshot(42L)))
+    assert(IcebergTimeTravel.fromVersion("v42").contains(Ref("v42")))
+    assert(IcebergTimeTravel.fromVersion("").contains(Ref("")))
+  }
+
+  test("main is read as the current table, without an AT clause") {
+    assert(IcebergTimeTravel.fromVersion("main").isEmpty)
+    assert(IcebergTimeTravel.fromRef("main").isEmpty)
+    // Iceberg ref names are case-sensitive
+    assert(IcebergTimeTravel.fromRef("MAIN").contains(Ref("MAIN")))
+    for (option <- Seq("branch" -> "main", "versionAsOf" -> "main")) {
+      val params = rewritten(option)
+      assert(params.get("dbtable").contains("MYDB.db.secret"), option)
+      assert(!params.contains("query"), option)
+      assert(!params.contains(option._1.toLowerCase), s"$option must not reach JDBC")
+    }
   }
 
   test("a fallback table without time travel options keeps dbtable") {
@@ -149,6 +162,7 @@ class IcebergTimeTravelSuite extends AnyFunSuite with BeforeAndAfterAll {
     val main = relation(fallbackTable).params
     IcebergTimeTravel.checkWrite(main, None)
     IcebergTimeTravel.checkWrite(main, Some(""))
+    IcebergTimeTravel.checkWrite(main, Some("main"))
     val e = intercept[UnsupportedOperationException](
       IcebergTimeTravel.checkWrite(main, Some("audit")))
     assert(e.getMessage.contains("spark.wap.branch=audit"))
