@@ -44,9 +44,19 @@ object IcebergTimeTravel {
     def clause: String = s"AT(TIMESTAMP => TO_TIMESTAMP_LTZ($micros, 6))"
   }
 
+  // Iceberg's SnapshotRef.MAIN_BRANCH; ref names are case-sensitive in Iceberg
+  val MainBranch = "main"
+
+  /**
+   * A branch or tag read. None for main: it is the table's current state, and Snowflake rejects
+   * AT(VERSION_REF => 'main'), so main is read without an AT clause.
+   */
+  def fromRef(name: String): Option[Spec] = if (name == MainBranch) None else Some(Ref(name))
+
   /** Spark's VERSION AS OF: a snapshot ID if numeric, otherwise a branch or tag (as Iceberg). */
-  def fromVersion(version: String): Spec =
-    if (version.nonEmpty && version.forall(_.isDigit)) Snapshot(version.toLong) else Ref(version)
+  def fromVersion(version: String): Option[Spec] =
+    if (version.nonEmpty && version.forall(_.isDigit)) Some(Snapshot(version.toLong))
+    else fromRef(version)
 
   private val SnapshotId = "snapshot-id"
   private val AsOfTimestamp = "as-of-timestamp"
@@ -57,15 +67,16 @@ object IcebergTimeTravel {
   private val TimestampAsOf = "timestampasof"
   private val ReadOptions = Seq(SnapshotId, AsOfTimestamp, Branch, Tag, VersionAsOf, TimestampAsOf)
 
-  private def fromOption(key: String, value: String): Spec = key match {
-    case SnapshotId => Snapshot(value.trim.toLong)
-    case AsOfTimestamp => TimestampMicros(Math.multiplyExact(value.trim.toLong, 1000L))
-    case Branch | Tag => Ref(value)
+  private def fromOption(key: String, value: String): Option[Spec] = key match {
+    case SnapshotId => Some(Snapshot(value.trim.toLong))
+    case AsOfTimestamp => Some(TimestampMicros(Math.multiplyExact(value.trim.toLong, 1000L)))
+    case Branch => fromRef(value)
+    case Tag => Some(Ref(value))
     case VersionAsOf => fromVersion(value.trim)
     case TimestampAsOf =>
       val zone = DateTimeUtils.getZoneId(SQLConf.get.sessionLocalTimeZone)
-      TimestampMicros(DateTimeUtils.stringToTimestamp(UTF8String.fromString(value.trim), zone)
-        .getOrElse(throw new IllegalArgumentException(s"Invalid timestampAsOf: $value")))
+      Some(TimestampMicros(DateTimeUtils.stringToTimestamp(UTF8String.fromString(value.trim), zone)
+        .getOrElse(throw new IllegalArgumentException(s"Invalid timestampAsOf: $value"))))
   }
 
   def query(dbtable: String, spec: Spec): String = s"SELECT * FROM $dbtable ${spec.clause}"
@@ -86,10 +97,11 @@ object IcebergTimeTravel {
       // The catalog already applied Spark's VERSION/TIMESTAMP AS OF to the query
       case (keys, Some(_)) if keys.forall(k => k == VersionAsOf || k == TimestampAsOf) => base
       case (Seq(key), None) =>
-        val dbtable = base.getOrElse(Parameters.PARAM_SF_DBTABLE,
-          throw new IllegalArgumentException(s"Time travel option '$key' requires dbtable"))
-        base - Parameters.PARAM_SF_DBTABLE +
-          (Parameters.PARAM_SF_QUERY -> query(dbtable, fromOption(key, params(key))))
+        fromOption(key, params(key)).fold(base) { spec =>
+          val dbtable = base.getOrElse(Parameters.PARAM_SF_DBTABLE,
+            throw new IllegalArgumentException(s"Time travel option '$key' requires dbtable"))
+          base - Parameters.PARAM_SF_DBTABLE + (Parameters.PARAM_SF_QUERY -> query(dbtable, spec))
+        }
       case (keys, _) =>
         throw new IllegalArgumentException(
           s"Cannot combine time travel options ${keys.mkString(", ")} with each other " +
@@ -105,7 +117,7 @@ object IcebergTimeTravel {
           "Cannot write to an Iceberg branch, tag or snapshot of a table read through " +
             "Snowflake (policy-protected table)")
       }
-      wapBranch.filter(_.nonEmpty).foreach { branch =>
+      wapBranch.filter(b => b.nonEmpty && b != MainBranch).foreach { branch =>
         throw new UnsupportedOperationException(
           s"spark.wap.branch=$branch is set, but writes to a policy-protected table go " +
             "through Snowflake, which cannot write to an Iceberg branch. Unset spark.wap.branch " +
