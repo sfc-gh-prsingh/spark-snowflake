@@ -135,8 +135,18 @@ class SnowflakeFallbackCatalogTimeTravelTest extends AnyFunSuite with BeforeAndA
       catalog().loadTable(Identifier.of(Array("db", "missing"), "branch_x")))
   }
 
-  test("metadata tables of a protected table keep the 403 instead of reading db.secret.refs") {
-    for (name <- Seq("fb", "fbnowh"); meta <- Seq("refs", "snapshots", "history")) {
+  test("the refs metadata table of a protected table is read from Snowflake") {
+    for ((name, dbtable) <- Seq("fb" -> "MYDB.db.secret", "fbnowh" -> "db.secret")) {
+      val table = catalog(name).loadTable(Identifier.of(Array("db", "secret"), "refs"))
+      assert(queryOf(table) == IcebergTimeTravel.query(dbtable, IcebergTimeTravel.Refs), name)
+    }
+    // Its relation is cached apart from the table's
+    val refs = catalog().loadTable(Identifier.of(Array("db", "secret"), "refs"))
+    assert(snowflakeTable(refs).catalogTable.identifier.catalog != Some("fb"))
+  }
+
+  test("other metadata tables of a protected table keep the 403 instead of reading db.secret.x") {
+    for (name <- Seq("fb", "fbnowh"); meta <- Seq("snapshots", "history", "entries")) {
       intercept[ForbiddenException](
         catalog(name).loadTable(Identifier.of(Array("db", "secret"), meta)))
     }

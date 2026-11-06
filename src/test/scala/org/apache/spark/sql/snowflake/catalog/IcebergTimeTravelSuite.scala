@@ -128,9 +128,26 @@ class IcebergTimeTravelSuite extends AnyFunSuite with BeforeAndAfterAll {
     "sfpassword" -> "p")
   private val schema = StructType(Seq(StructField("id", IntegerType)))
 
-  private def relation(params: Map[String, String]): FallbackRelation =
-    new FallbackDefaultSource().createRelation(spark.sqlContext, params ++ creds, schema)
+  private def relation(
+      params: Map[String, String],
+      source: FallbackDefaultSource = new FallbackDefaultSource()): FallbackRelation =
+    source.createRelation(spark.sqlContext, params ++ creds, schema)
       .asInstanceOf[FallbackRelation]
+
+  /** Answers the branch lookup from `branches` instead of Snowflake, and records the lookups. */
+  private class StubRefsSource(branches: Set[String]) extends FallbackDefaultSource {
+    val lookups = scala.collection.mutable.ArrayBuffer[(String, String)]()
+    override protected def branchExists(
+        params: Map[String, String], dbtable: String, branch: String): Boolean = {
+      lookups += (dbtable -> branch)
+      branches.contains(branch)
+    }
+  }
+
+  private def withWapBranch[T](branch: String)(f: => T): T = {
+    spark.conf.set("spark.wap.branch", branch)
+    try f finally spark.conf.unset("spark.wap.branch")
+  }
 
   // SnowflakeRelation is private to the connector package, so it is read by reflection
   private def paramsOf(rel: FallbackRelation): Parameters.MergedParameters =
@@ -183,6 +200,58 @@ class IcebergTimeTravelSuite extends AnyFunSuite with BeforeAndAfterAll {
     val e = intercept[UnsupportedOperationException](
       IcebergTimeTravel.checkWrite(timeTravel = false, Some("audit")))
     assert(e.getMessage.contains("spark.wap.branch=audit"))
+  }
+
+  test("with spark.wap.branch set, a plain read reads the WAP branch once it exists") {
+    withWapBranch("dev") {
+      val source = new StubRefsSource(Set("dev"))
+      val rel = relation(fallbackTable, source)
+      assert(paramsOf(rel).query.contains("SELECT * FROM MYDB.db.secret AT(BRANCH => 'dev')"))
+      assert(paramsOf(rel).table.isEmpty)
+      assert(source.lookups == Seq("MYDB.db.secret" -> "dev"))
+    }
+  }
+
+  test("with spark.wap.branch set to a branch that doesn't exist yet, a plain read reads main") {
+    withWapBranch("dev") {
+      val rel = relation(fallbackTable, new StubRefsSource(Set.empty))
+      assert(paramsOf(rel).table.map(_.toString).contains("MYDB.db.secret"))
+      assert(paramsOf(rel).query.isEmpty)
+    }
+  }
+
+  test("an explicit version wins over spark.wap.branch, and main needs no lookup") {
+    withWapBranch("dev") {
+      val source = new StubRefsSource(Set("dev"))
+      val rel = relation(fallbackTable + ("snapshot-id" -> "123"), source)
+      assert(paramsOf(rel).query.contains("SELECT * FROM MYDB.db.secret AT(VERSION => 123)"))
+      assert(source.lookups.isEmpty)
+    }
+    withWapBranch("main") {
+      val source = new StubRefsSource(Set("main"))
+      assert(paramsOf(relation(fallbackTable, source)).query.isEmpty)
+      assert(source.lookups.isEmpty)
+    }
+  }
+
+  test("a write with spark.wap.branch set fails with the WAP message, also on a WAP branch read") {
+    val e = intercept[UnsupportedOperationException](
+      IcebergTimeTravel.checkWrite(timeTravel = true, Some("dev")))
+    assert(e.getMessage.contains("spark.wap.branch=dev"))
+  }
+
+  test("the refs metadata table is read from GET_TABLE_VERSION_REFS with Iceberg's columns") {
+    assert(IcebergTimeTravel.query("MYDB.db.secret", IcebergTimeTravel.Refs) ==
+      "SELECT REFERENCE_NAME AS \"name\", REFERENCE_TYPE AS \"type\", VERSION_ID AS " +
+        "\"snapshot_id\", MAX_REFERENCE_AGE_IN_MS AS \"max_reference_age_in_ms\", " +
+        "MIN_SNAPSHOTS_TO_KEEP AS \"min_snapshots_to_keep\", MAX_SNAPSHOT_AGE_IN_MS AS " +
+        "\"max_snapshot_age_in_ms\" FROM TABLE(MYDB.INFORMATION_SCHEMA.GET_TABLE_VERSION_REFS(" +
+        "TABLE_NAME => 'MYDB.db.secret'))")
+    // Without a database in dbtable, the function resolves in the session's database
+    assert(IcebergTimeTravel.query("db.secret", IcebergTimeTravel.Refs)
+      .endsWith("FROM TABLE(INFORMATION_SCHEMA.GET_TABLE_VERSION_REFS(TABLE_NAME => 'db.secret'))"))
+    assert(IcebergTimeTravel.branchExistsQuery("MYDB.db.secret", "it's").endsWith(
+      "WHERE \"name\" = 'it''s' AND \"type\" = 'BRANCH'"))
   }
 
   test("the Snowflake data source itself is unchanged") {
