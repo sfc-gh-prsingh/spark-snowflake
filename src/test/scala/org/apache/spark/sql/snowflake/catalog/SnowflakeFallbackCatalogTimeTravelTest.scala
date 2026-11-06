@@ -118,7 +118,7 @@ class SnowflakeFallbackCatalogTimeTravelTest extends AnyFunSuite with BeforeAndA
 
   test("Iceberg selector names on a protected table fall back with the matching AT clause") {
     val cases = Seq(
-      "branch_x" -> "AT(VERSION_REF => 'x')",
+      "branch_x" -> "AT(BRANCH => 'x')",
       "tag_t" -> "AT(VERSION_REF => 't')",
       s"snapshot_id_$snapshotId" -> s"AT(VERSION => $snapshotId)",
       "at_timestamp_1764547200000" -> "AT(TIMESTAMP => TO_TIMESTAMP_LTZ(1764547200000000, 6))")

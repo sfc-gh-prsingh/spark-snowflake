@@ -18,7 +18,7 @@ package org.apache.spark.sql.snowflake.catalog
 import java.time.{LocalDateTime, ZoneId}
 
 import net.snowflake.spark.snowflake.{DefaultSource, Parameters}
-import org.apache.spark.sql.snowflake.catalog.IcebergTimeTravel.{Ref, Snapshot}
+import org.apache.spark.sql.snowflake.catalog.IcebergTimeTravel.{Branch, Ref, Snapshot}
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.sources.Filter
 import org.apache.spark.sql.types.{IntegerType, StructField, StructType}
@@ -57,7 +57,7 @@ class IcebergTimeTravelSuite extends AnyFunSuite with BeforeAndAfterAll {
       ("snapshot-id" -> "123") -> "AT(VERSION => 123)",
       ("as-of-timestamp" -> epochMillis.toString) ->
         s"AT(TIMESTAMP => TO_TIMESTAMP_LTZ(${epochMillis * 1000L}, 6))",
-      ("branch" -> "audit") -> "AT(VERSION_REF => 'audit')",
+      ("branch" -> "audit") -> "AT(BRANCH => 'audit')",
       ("tag" -> "v1") -> "AT(VERSION_REF => 'v1')",
       ("versionAsOf" -> "123") -> "AT(VERSION => 123)",
       ("versionAsOf" -> "audit") -> "AT(VERSION_REF => 'audit')",
@@ -72,7 +72,16 @@ class IcebergTimeTravelSuite extends AnyFunSuite with BeforeAndAfterAll {
 
   test("branch and tag names are quoted as Snowflake string literals") {
     assert(query("branch" -> "it's") ==
+      Some("SELECT * FROM MYDB.db.secret AT(BRANCH => 'it''s')"))
+    assert(query("tag" -> "it's") ==
       Some("SELECT * FROM MYDB.db.secret AT(VERSION_REF => 'it''s')"))
+  }
+
+  test("a read known to be of a branch uses AT(BRANCH); a branch-or-tag name uses VERSION_REF") {
+    // Snowflake refreshes a recorded branch of an unmanaged table only for AT(BRANCH)
+    assert(IcebergTimeTravel.fromBranch("dev").contains(Branch("dev")))
+    assert(IcebergTimeTravel.fromBranch("main").isEmpty)
+    assert(IcebergTimeTravel.fromVersion("dev").contains(Ref("dev")))
   }
 
   test("VERSION AS OF picks a snapshot ID only for numeric versions") {

@@ -186,7 +186,7 @@ class SnowflakeFallbackCatalog extends SparkCatalog {
       case SnapshotIdSelector(id) => Some(Some(IcebergTimeTravel.Snapshot(id.toLong)))
       case AtTimestampSelector(ms) =>
         Some(Some(IcebergTimeTravel.TimestampMicros(ms.toLong * 1000L)))
-      case BranchSelector(ref) => Some(IcebergTimeTravel.fromRef(ref))
+      case BranchSelector(ref) => Some(IcebergTimeTravel.fromBranch(ref))
       case TagSelector(ref) => Some(Some(IcebergTimeTravel.Ref(ref)))
       case _ => None
     }
