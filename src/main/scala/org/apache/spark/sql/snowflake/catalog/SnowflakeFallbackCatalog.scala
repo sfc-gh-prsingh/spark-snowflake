@@ -109,8 +109,13 @@ class SnowflakeFallbackCatalog extends SparkCatalog {
       case ex: Throwable if inVersionedLoad.get() => throw ex
       case ex: Throwable =>
         if (isForbiddenException(ex)) {
-          if (isMetadataTableOfProtected(ident)) throw ex
-          fallbackToSnowflake(ident, None, ex)
+          if (isMetadataTableOfProtected(ident)) {
+            // Snowflake has only the refs metadata table (GET_TABLE_VERSION_REFS)
+            if (!ident.name().equalsIgnoreCase("refs")) throw ex
+            fallbackToSnowflake(parentOf(ident), Some(IcebergTimeTravel.Refs), ex)
+          } else {
+            fallbackToSnowflake(ident, None, ex)
+          }
         } else if (ex.isInstanceOf[NoSuchTableException]) {
           loadProtectedSelector(ident).getOrElse(throw ex)
         } else {
@@ -161,10 +166,13 @@ class SnowflakeFallbackCatalog extends SparkCatalog {
    * Iceberg's REST client also returns the base table's 403 for its metadata tables (db.t.refs);
    * Snowflake has no equivalent, so they must not fall back to a table named db.t.refs.
    */
+  private def parentOf(ident: Identifier): Identifier =
+    Identifier.of(ident.namespace().init, ident.namespace().last)
+
   private def isMetadataTableOfProtected(ident: Identifier): Boolean =
     ident.namespace().nonEmpty &&
       IcebergMetadataTables.contains(ident.name().toLowerCase(java.util.Locale.ROOT)) && {
-        val parent = Identifier.of(ident.namespace().init, ident.namespace().last)
+        val parent = parentOf(ident)
         try {
           super.loadTable(parent)
           false
@@ -191,7 +199,7 @@ class SnowflakeFallbackCatalog extends SparkCatalog {
       case _ => None
     }
     selector.flatMap { spec =>
-      val parent = Identifier.of(ident.namespace().init, ident.namespace().last)
+      val parent = parentOf(ident)
       try {
         super.loadTable(parent)
         None

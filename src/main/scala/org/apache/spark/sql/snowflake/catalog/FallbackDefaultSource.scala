@@ -15,7 +15,7 @@
  */
 package org.apache.spark.sql.snowflake.catalog
 
-import net.snowflake.spark.snowflake.{DefaultSource, Parameters}
+import net.snowflake.spark.snowflake.{DefaultSource, Parameters, Utils}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{DataFrame, Row, SQLContext}
 import org.apache.spark.sql.sources.{BaseRelation, Filter, InsertableRelation, PrunedFilteredScan}
@@ -30,7 +30,7 @@ class FallbackDefaultSource extends DefaultSource {
 
   override def createRelation(
       sqlContext: SQLContext, parameters: Map[String, String]): BaseRelation = {
-    val params = IcebergTimeTravel.rewriteReadParameters(parameters)
+    val params = readParameters(sqlContext, parameters)
     FallbackRelation(super.createRelation(sqlContext, params), params)
   }
 
@@ -38,9 +38,31 @@ class FallbackDefaultSource extends DefaultSource {
       sqlContext: SQLContext,
       parameters: Map[String, String],
       schema: StructType): BaseRelation = {
-    val params = IcebergTimeTravel.rewriteReadParameters(parameters)
+    val params = readParameters(sqlContext, parameters)
     FallbackRelation(super.createRelation(sqlContext, params, schema), params)
   }
+
+  /**
+   * Time travel read options, then spark.wap.branch: as in Iceberg, a read that names no
+   * version reads the WAP branch once the branch exists. Iceberg also requires the table
+   * property write.wap.enabled, which a 403 hides; setting spark.wap.branch stands for it.
+   */
+  private def readParameters(
+      sqlContext: SQLContext, parameters: Map[String, String]): Map[String, String] = {
+    val params = IcebergTimeTravel.rewriteReadParameters(parameters)
+    (IcebergTimeTravel.wapBranch(sqlContext.sparkSession.conf),
+      params.get(Parameters.PARAM_SF_DBTABLE)) match {
+      case (Some(branch), Some(dbtable))
+          if !params.contains(Parameters.PARAM_SF_QUERY) && branchExists(params, dbtable, branch) =>
+        params - Parameters.PARAM_SF_DBTABLE + (Parameters.PARAM_SF_QUERY ->
+          IcebergTimeTravel.query(dbtable, IcebergTimeTravel.Branch(branch)))
+      case _ => params
+    }
+  }
+
+  protected def branchExists(
+      params: Map[String, String], dbtable: String, branch: String): Boolean =
+    Utils.runQuery(params, IcebergTimeTravel.branchExistsQuery(dbtable, branch)).next()
 }
 
 private[catalog] object FallbackRelation {

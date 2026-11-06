@@ -28,8 +28,11 @@ import org.apache.spark.unsafe.types.UTF8String
  */
 private[catalog] object IcebergTimeTravel {
 
+  /** A read of a fallback table that Snowflake answers with a query instead of dbtable. */
   sealed trait Spec {
+    /** Distinguishes the read in the table's relation cache key. */
     def clause: String
+    def query(dbtable: String): String = s"SELECT * FROM $dbtable $clause"
   }
 
   final case class Snapshot(id: Long) extends Spec {
@@ -51,6 +54,22 @@ private[catalog] object IcebergTimeTravel {
 
   final case class TimestampMicros(micros: Long) extends Spec {
     def clause: String = s"AT(TIMESTAMP => TO_TIMESTAMP_LTZ($micros, 6))"
+  }
+
+  /** Iceberg's refs metadata table, from Snowflake's GET_TABLE_VERSION_REFS. */
+  case object Refs extends Spec {
+    def clause: String = "REFS"
+    override def query(dbtable: String): String = {
+      // The function resolves in a database's INFORMATION_SCHEMA; dbtable is unquoted
+      val parts = dbtable.split('.')
+      val infoSchema =
+        if (parts.length == 3) s"${parts(0)}.INFORMATION_SCHEMA" else "INFORMATION_SCHEMA"
+      """SELECT REFERENCE_NAME AS "name", REFERENCE_TYPE AS "type", VERSION_ID AS """ +
+        """"snapshot_id", MAX_REFERENCE_AGE_IN_MS AS "max_reference_age_in_ms", """ +
+        """MIN_SNAPSHOTS_TO_KEEP AS "min_snapshots_to_keep", MAX_SNAPSHOT_AGE_IN_MS AS """ +
+        s""""max_snapshot_age_in_ms" FROM TABLE($infoSchema.GET_TABLE_VERSION_REFS(""" +
+        s"""TABLE_NAME => '${quote(dbtable)}'))"""
+    }
   }
 
   // Iceberg's SnapshotRef.MAIN_BRANCH; ref names are case-sensitive in Iceberg
@@ -94,7 +113,15 @@ private[catalog] object IcebergTimeTravel {
 
   private def quote(name: String): String = name.replace("'", "''")
 
-  def query(dbtable: String, spec: Spec): String = s"SELECT * FROM $dbtable ${spec.clause}"
+  def query(dbtable: String, spec: Spec): String = spec.query(dbtable)
+
+  /** Lists the branch if the table's refs have it. */
+  def branchExistsQuery(dbtable: String, branch: String): String =
+    s"""SELECT 1 FROM (${Refs.query(dbtable)}) WHERE "name" = '${quote(branch)}' AND "type" = 'BRANCH'"""
+
+  /** spark.wap.branch, unless unset or main. */
+  def wapBranch(conf: org.apache.spark.sql.RuntimeConfig): Option[String] =
+    conf.getOption("spark.wap.branch").filter(b => b.nonEmpty && b != MainBranch)
 
   /**
    * Rewrites the read parameters of a fallback table: a time travel read option becomes a query
@@ -126,16 +153,17 @@ private[catalog] object IcebergTimeTravel {
    * timeTravel: the relation reads a branch, tag or snapshot (its parameters have a query).
    */
   def checkWrite(timeTravel: Boolean, wapBranch: Option[String]): Unit = {
-    if (timeTravel) {
-      throw new UnsupportedOperationException(
-        "Cannot write to an Iceberg branch, tag or snapshot of a table read through " +
-          "Snowflake (policy-protected table)")
-    }
+    // Checked first: with spark.wap.branch set, a read of the table is itself a branch read
     wapBranch.filter(b => b.nonEmpty && b != MainBranch).foreach { branch =>
       throw new UnsupportedOperationException(
         s"spark.wap.branch=$branch is set, but writes to a policy-protected table go " +
           "through Snowflake, which cannot write to an Iceberg branch. Unset spark.wap.branch " +
           "to write to the main branch.")
+    }
+    if (timeTravel) {
+      throw new UnsupportedOperationException(
+        "Cannot write to an Iceberg branch, tag or snapshot of a table read through " +
+          "Snowflake (policy-protected table)")
     }
   }
 }
