@@ -13,10 +13,11 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package net.snowflake.spark.snowflake
+package org.apache.spark.sql.snowflake.catalog
 
 import java.util.Locale
 
+import net.snowflake.spark.snowflake.Parameters
 import org.apache.spark.sql.catalyst.util.DateTimeUtils
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.unsafe.types.UTF8String
@@ -25,7 +26,7 @@ import org.apache.spark.unsafe.types.UTF8String
  * Iceberg time travel for tables that SnowflakeFallbackCatalog reads over JDBC after a 403:
  * maps snapshot / branch / tag / timestamp requests to Snowflake's AT clause.
  */
-object IcebergTimeTravel {
+private[catalog] object IcebergTimeTravel {
 
   sealed trait Spec {
     def clause: String
@@ -82,14 +83,11 @@ object IcebergTimeTravel {
   def query(dbtable: String, spec: Spec): String = s"SELECT * FROM $dbtable ${spec.clause}"
 
   /**
-   * Rewrites read parameters of a fallback table: a time travel read option becomes a query
-   * with the matching AT clause. Parameters of other Snowflake tables are returned unchanged.
+   * Rewrites the read parameters of a fallback table: a time travel read option becomes a query
+   * with the matching AT clause.
    */
   def rewriteReadParameters(parameters: Map[String, String]): Map[String, String] = {
     val params = parameters.map { case (k, v) => k.toLowerCase(Locale.ROOT) -> v }
-    if (!params.contains(Parameters.PARAM_ICEBERG_FALLBACK)) {
-      return parameters
-    }
     val requested = ReadOptions.filter(params.contains)
     val base = params -- ReadOptions
     (requested, base.get(Parameters.PARAM_SF_QUERY)) match {
@@ -109,20 +107,21 @@ object IcebergTimeTravel {
     }
   }
 
-  /** Branch writes have no Snowflake SQL equivalent, so they fail instead of writing main. */
-  def checkWrite(params: Parameters.MergedParameters, wapBranch: Option[String]): Unit = {
-    if (params.parameters.contains(Parameters.PARAM_ICEBERG_FALLBACK)) {
-      if (params.query.isDefined) {
-        throw new UnsupportedOperationException(
-          "Cannot write to an Iceberg branch, tag or snapshot of a table read through " +
-            "Snowflake (policy-protected table)")
-      }
-      wapBranch.filter(b => b.nonEmpty && b != MainBranch).foreach { branch =>
-        throw new UnsupportedOperationException(
-          s"spark.wap.branch=$branch is set, but writes to a policy-protected table go " +
-            "through Snowflake, which cannot write to an Iceberg branch. Unset spark.wap.branch " +
-            "to write to the main branch.")
-      }
+  /**
+   * Branch writes have no Snowflake SQL equivalent, so they fail instead of writing main.
+   * timeTravel: the relation reads a branch, tag or snapshot (its parameters have a query).
+   */
+  def checkWrite(timeTravel: Boolean, wapBranch: Option[String]): Unit = {
+    if (timeTravel) {
+      throw new UnsupportedOperationException(
+        "Cannot write to an Iceberg branch, tag or snapshot of a table read through " +
+          "Snowflake (policy-protected table)")
+    }
+    wapBranch.filter(b => b.nonEmpty && b != MainBranch).foreach { branch =>
+      throw new UnsupportedOperationException(
+        s"spark.wap.branch=$branch is set, but writes to a policy-protected table go " +
+          "through Snowflake, which cannot write to an Iceberg branch. Unset spark.wap.branch " +
+          "to write to the main branch.")
     }
   }
 }

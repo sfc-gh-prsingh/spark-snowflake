@@ -26,7 +26,7 @@ import org.apache.spark.sql.connector.catalog.{Identifier, TableCatalog, V1Table
 import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funsuite.AnyFunSuite
 
-/** Time travel on a table that Horizon 403s (simulated by ForbiddingSparkCatalog). */
+/** Time travel on a table that Horizon 403s (simulated by ForbiddingFallbackCatalog). */
 class SnowflakeFallbackCatalogTimeTravelTest extends AnyFunSuite with BeforeAndAfterAll {
 
   private var spark: SparkSession = _
@@ -38,8 +38,7 @@ class SnowflakeFallbackCatalogTimeTravelTest extends AnyFunSuite with BeforeAndA
     SparkSession.getDefaultSession.foreach(_.stop())
     val path = Files.createTempDirectory("fallback-time-travel").toUri.toString
     def fallback(b: SparkSession.Builder, name: String) = b
-      .config(s"spark.sql.catalog.$name", classOf[SnowflakeFallbackCatalog].getName)
-      .config(s"spark.sql.catalog.$name.catalog-impl", classOf[ForbiddingSparkCatalog].getName)
+      .config(s"spark.sql.catalog.$name", classOf[ForbiddingFallbackCatalog].getName)
       .config(s"spark.sql.catalog.$name.hadoop-warehouse", path)
       .config(s"spark.sql.catalog.$name.forbidden-tables", "db.secret")
       .config(s"spark.sql.catalog.$name.cache-enabled", "false")
@@ -72,8 +71,7 @@ class SnowflakeFallbackCatalogTimeTravelTest extends AnyFunSuite with BeforeAndA
   private def snowflakeTable(table: AnyRef): V1Table = {
     assert(table.isInstanceOf[V1Table], s"expected a Snowflake V1Table, got $table")
     val v1 = table.asInstanceOf[V1Table]
-    assert(v1.catalogTable.provider.contains("net.snowflake.spark.snowflake.DefaultSource"))
-    assert(v1.catalogTable.storage.properties.get("snowflake_iceberg_fallback").contains("true"))
+    assert(v1.catalogTable.provider.contains(classOf[FallbackDefaultSource].getName))
     v1
   }
 

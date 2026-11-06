@@ -36,11 +36,10 @@ class SnowflakeFallbackCatalogIcebergTest extends AnyFunSuite with BeforeAndAfte
       .config("spark.ui.enabled", "false")
       // Iceberg probes optional classes on executors; don't route misses to the artifact server
       .config("spark.sql.artifact.isolation.enabled", "false")
+      // Only Iceberg's extensions, as for Iceberg's own SparkCatalog
       .config("spark.sql.extensions",
-        "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions," +
-          classOf[SnowflakeFallbackCatalogExtensions].getName)
+        "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
       .config("spark.sql.catalog.fb", classOf[SnowflakeFallbackCatalog].getName)
-      .config("spark.sql.catalog.fb.catalog-impl", "org.apache.iceberg.spark.SparkCatalog")
       .config("spark.sql.catalog.fb.type", "hadoop")
       .config("spark.sql.catalog.fb.warehouse", warehouse)
       .getOrCreate()
