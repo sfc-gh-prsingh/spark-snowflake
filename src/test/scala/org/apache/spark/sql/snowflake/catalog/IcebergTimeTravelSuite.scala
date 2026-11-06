@@ -13,11 +13,12 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-package net.snowflake.spark.snowflake
+package org.apache.spark.sql.snowflake.catalog
 
 import java.time.{LocalDateTime, ZoneId}
 
-import net.snowflake.spark.snowflake.IcebergTimeTravel.{Ref, Snapshot, TimestampMicros}
+import net.snowflake.spark.snowflake.{DefaultSource, Parameters}
+import org.apache.spark.sql.snowflake.catalog.IcebergTimeTravel.{Ref, Snapshot}
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.sources.Filter
 import org.apache.spark.sql.types.{IntegerType, StructField, StructType}
@@ -39,10 +40,7 @@ class IcebergTimeTravelSuite extends AnyFunSuite with BeforeAndAfterAll {
 
   override def afterAll(): Unit = if (spark != null) spark.stop()
 
-  private val fallbackTable = Map(
-    "dbtable" -> "MYDB.db.secret",
-    "sfdatabase" -> "MYDB",
-    Parameters.PARAM_ICEBERG_FALLBACK -> "true")
+  private val fallbackTable = Map("dbtable" -> "MYDB.db.secret", "sfdatabase" -> "MYDB")
 
   private def rewritten(options: (String, String)*): Map[String, String] =
     IcebergTimeTravel.rewriteReadParameters(fallbackTable ++ options)
@@ -69,7 +67,6 @@ class IcebergTimeTravelSuite extends AnyFunSuite with BeforeAndAfterAll {
       assert(params.get("query").contains(s"SELECT * FROM MYDB.db.secret $clause"), option)
       assert(!params.contains("dbtable"), option)
       assert(!params.contains(option._1.toLowerCase), s"$option must not reach JDBC")
-      assert(params.get(Parameters.PARAM_ICEBERG_FALLBACK).contains("true"))
     }
   }
 
@@ -101,11 +98,6 @@ class IcebergTimeTravelSuite extends AnyFunSuite with BeforeAndAfterAll {
     assert(rewritten() == fallbackTable)
   }
 
-  test("non-fallback Snowflake tables are not rewritten") {
-    val plain = Map("dbtable" -> "T", "branch" -> "x", "snapshot-id" -> "1")
-    assert(IcebergTimeTravel.rewriteReadParameters(plain) == plain)
-  }
-
   test("Spark's own AS OF options are dropped once the catalog applied them") {
     val applied = fallbackTable - "dbtable" + ("query" -> "SELECT * FROM t AT(VERSION => 1)")
     assert(IcebergTimeTravel.rewriteReadParameters(applied + ("versionAsOf" -> "1")) == applied)
@@ -127,49 +119,66 @@ class IcebergTimeTravelSuite extends AnyFunSuite with BeforeAndAfterAll {
     "sfpassword" -> "p")
   private val schema = StructType(Seq(StructField("id", IntegerType)))
 
-  private def relation(params: Map[String, String]): SnowflakeRelation =
-    new DefaultSource().createRelation(spark.sqlContext, params ++ creds, schema)
-      .asInstanceOf[SnowflakeRelation]
+  private def relation(params: Map[String, String]): FallbackRelation =
+    new FallbackDefaultSource().createRelation(spark.sqlContext, params ++ creds, schema)
+      .asInstanceOf[FallbackRelation]
 
-  private def selectSql(rel: SnowflakeRelation): String = {
-    val method = rel.getClass.getDeclaredMethods.find(_.getName.endsWith("standardStatement")).get
+  // SnowflakeRelation is private to the connector package, so it is read by reflection
+  private def paramsOf(rel: FallbackRelation): Parameters.MergedParameters =
+    rel.relation.getClass.getMethod("params").invoke(rel.relation)
+      .asInstanceOf[Parameters.MergedParameters]
+
+  private def selectSql(rel: FallbackRelation): String = {
+    val inner = rel.relation
+    val method =
+      inner.getClass.getDeclaredMethods.find(_.getName.endsWith("standardStatement")).get
     method.setAccessible(true)
-    method.invoke(rel, Array("id"), Array.empty[Filter])
-      .asInstanceOf[SnowflakeSQLStatement].statementString
+    val statement = method.invoke(inner, Array("id"), Array.empty[Filter])
+    statement.getClass.getMethod("statementString").invoke(statement).asInstanceOf[String]
   }
 
-  test("DefaultSource sends the AT clause in the SELECT for fallback tables") {
+  test("FallbackDefaultSource sends the AT clause in the SELECT") {
     val rel = relation(fallbackTable + ("snapshot-id" -> "123"))
-    assert(rel.params.table.isEmpty)
+    assert(paramsOf(rel).table.isEmpty)
     assert(selectSql(rel) ==
       """SELECT "ID" FROM (SELECT * FROM MYDB.db.secret AT(VERSION => 123))""")
-    assert(!rel.params.sfExtraOptions.contains("snapshot-id"))
-    assert(!rel.params.sfExtraOptions.contains(Parameters.PARAM_ICEBERG_FALLBACK))
+    assert(!paramsOf(rel).sfExtraOptions.contains("snapshot-id"))
+    assert(rel.timeTravel)
   }
 
-  test("DefaultSource reads a fallback table without options from dbtable") {
+  test("FallbackDefaultSource reads a table without options from dbtable") {
     val rel = relation(fallbackTable)
-    assert(rel.params.table.map(_.toString).contains("MYDB.db.secret"))
-    assert(rel.params.query.isEmpty)
+    assert(paramsOf(rel).table.map(_.toString).contains("MYDB.db.secret"))
+    assert(paramsOf(rel).query.isEmpty)
+    assert(!rel.timeTravel)
+  }
+
+  test("FallbackRelation passes reads through to the Snowflake relation") {
+    val rel = relation(fallbackTable)
+    assert(rel.schema == schema)
+    assert(rel.sizeInBytes == rel.relation.sizeInBytes)
+    assert(rel.needConversion == rel.relation.needConversion)
+    val filters: Array[Filter] = Array(org.apache.spark.sql.sources.EqualTo("id", 1))
+    assert(rel.unhandledFilters(filters).toSeq == rel.relation.unhandledFilters(filters).toSeq)
   }
 
   test("writes to a branch, tag or snapshot of a fallback table fail") {
-    val atSnapshot = relation(fallbackTable + ("branch" -> "x")).params
-    intercept[UnsupportedOperationException](IcebergTimeTravel.checkWrite(atSnapshot, None))
+    assert(relation(fallbackTable + ("branch" -> "x")).timeTravel)
+    intercept[UnsupportedOperationException](IcebergTimeTravel.checkWrite(timeTravel = true, None))
   }
 
   test("writes to a fallback table with spark.wap.branch set fail instead of writing main") {
-    val main = relation(fallbackTable).params
-    IcebergTimeTravel.checkWrite(main, None)
-    IcebergTimeTravel.checkWrite(main, Some(""))
-    IcebergTimeTravel.checkWrite(main, Some("main"))
+    IcebergTimeTravel.checkWrite(timeTravel = false, None)
+    IcebergTimeTravel.checkWrite(timeTravel = false, Some(""))
+    IcebergTimeTravel.checkWrite(timeTravel = false, Some("main"))
     val e = intercept[UnsupportedOperationException](
-      IcebergTimeTravel.checkWrite(main, Some("audit")))
+      IcebergTimeTravel.checkWrite(timeTravel = false, Some("audit")))
     assert(e.getMessage.contains("spark.wap.branch=audit"))
   }
 
-  test("writes to other Snowflake tables are not affected by spark.wap.branch") {
-    val plain = relation(Map("dbtable" -> "T")).params
-    IcebergTimeTravel.checkWrite(plain, Some("audit"))
+  test("the Snowflake data source itself is unchanged") {
+    val plain = new DefaultSource().createRelation(
+      spark.sqlContext, Map("dbtable" -> "T", "branch" -> "x") ++ creds, schema)
+    assert(!plain.isInstanceOf[FallbackRelation])
   }
 }
