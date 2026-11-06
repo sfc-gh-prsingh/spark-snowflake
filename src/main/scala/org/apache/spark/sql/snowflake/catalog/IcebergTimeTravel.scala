@@ -38,7 +38,15 @@ private[catalog] object IcebergTimeTravel {
 
   /** A branch or tag; Snowflake's VERSION_REF resolves either. */
   final case class Ref(name: String) extends Spec {
-    def clause: String = s"AT(VERSION_REF => '${name.replace("'", "''")}')"
+    def clause: String = s"AT(VERSION_REF => '${quote(name)}')"
+  }
+
+  /**
+   * A branch. Snowflake refreshes a branch of an unmanaged table that it has only recorded when a
+   * query reads it with AT(BRANCH); AT(VERSION_REF) fails with "branch has not been refreshed".
+   */
+  final case class Branch(name: String) extends Spec {
+    def clause: String = s"AT(BRANCH => '${quote(name)}')"
   }
 
   final case class TimestampMicros(micros: Long) extends Spec {
@@ -54,6 +62,9 @@ private[catalog] object IcebergTimeTravel {
    */
   def fromRef(name: String): Option[Spec] = if (name == MainBranch) None else Some(Ref(name))
 
+  /** A read known to be of a branch; None for main, as in fromRef. */
+  def fromBranch(name: String): Option[Spec] = if (name == MainBranch) None else Some(Branch(name))
+
   /** Spark's VERSION AS OF: a snapshot ID if numeric, otherwise a branch or tag (as Iceberg). */
   def fromVersion(version: String): Option[Spec] =
     if (version.nonEmpty && version.forall(_.isDigit)) Some(Snapshot(version.toLong))
@@ -61,17 +72,18 @@ private[catalog] object IcebergTimeTravel {
 
   private val SnapshotId = "snapshot-id"
   private val AsOfTimestamp = "as-of-timestamp"
-  private val Branch = "branch"
+  private val BranchOption = "branch"
   private val Tag = "tag"
   // Spark's own read options; on 4.x Spark turns them into loadTable(ident, version|timestamp)
   private val VersionAsOf = "versionasof"
   private val TimestampAsOf = "timestampasof"
-  private val ReadOptions = Seq(SnapshotId, AsOfTimestamp, Branch, Tag, VersionAsOf, TimestampAsOf)
+  private val ReadOptions =
+    Seq(SnapshotId, AsOfTimestamp, BranchOption, Tag, VersionAsOf, TimestampAsOf)
 
   private def fromOption(key: String, value: String): Option[Spec] = key match {
     case SnapshotId => Some(Snapshot(value.trim.toLong))
     case AsOfTimestamp => Some(TimestampMicros(Math.multiplyExact(value.trim.toLong, 1000L)))
-    case Branch => fromRef(value)
+    case BranchOption => fromBranch(value)
     case Tag => Some(Ref(value))
     case VersionAsOf => fromVersion(value.trim)
     case TimestampAsOf =>
@@ -79,6 +91,8 @@ private[catalog] object IcebergTimeTravel {
       Some(TimestampMicros(DateTimeUtils.stringToTimestamp(UTF8String.fromString(value.trim), zone)
         .getOrElse(throw new IllegalArgumentException(s"Invalid timestampAsOf: $value"))))
   }
+
+  private def quote(name: String): String = name.replace("'", "''")
 
   def query(dbtable: String, spec: Spec): String = s"SELECT * FROM $dbtable ${spec.clause}"
 
