@@ -150,10 +150,13 @@ class SnowflakeSparkTableTest extends AnyFunSuite with BeforeAndAfterAll with Be
     spark.sql("ALTER TABLE fb.db.secret CREATE TAG Rel1")
     spark.sql("ALTER TABLE fb.db.secret CREATE TAG rel2 AS OF VERSION 1 RETAIN 30 DAYS")
     spark.sql("ALTER TABLE fb.db.secret REPLACE TAG t0 AS OF VERSION 2 RETAIN 90 MINUTES")
+    spark.sql("ALTER TABLE fb.db.secret CREATE TAG rel3 RETAIN 2 HOURS")
     assert(statements == Seq(
       s"""$alter CREATE VERSION_TAG "Rel1"""",
       s"""$alter CREATE VERSION_TAG "rel2" AS OF VERSION 1 RETAIN 30 DAYS""",
-      s"""$alter REPLACE VERSION_TAG "t0" AS OF VERSION 2 RETAIN 90 MINUTES"""))
+      s"""$alter REPLACE VERSION_TAG "t0" AS OF VERSION 2 RETAIN 90 MINUTES""",
+      // A tag at the tip with RETAIN names main's snapshot: Snowflake requires AS OF there
+      s"""$alter CREATE VERSION_TAG "rel3" AS OF VERSION 3 RETAIN 2 HOURS"""))
   }
 
   test("branch retention fails before Snowflake runs anything") {

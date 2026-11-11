@@ -326,7 +326,9 @@ private[catalog] class SnowflakeManageSnapshots(table: SnowflakeIcebergTable)
       case CreateBranch(name, id, true) => s"$alter REPLACE BRANCH '${quote(name)}'${asOf(id)}"
       case CreateTag(name, id, replace, retain) =>
         s"$alter ${if (replace) "REPLACE" else "CREATE"} VERSION_TAG ${quoteIdentifier(name)}" +
-          asOf(snapshotOf(id)) + retain.fold("")(ms => " " + retainClause(ms))
+          // Snowflake's tag at the tip takes no RETAIN, and REPLACE requires AS OF
+          asOf(if (replace || retain.isDefined) Some(id) else snapshotOf(id)) +
+          retain.fold("")(ms => " " + retainClause(ms))
       case DropRef(name, false) => s"$alter DROP BRANCH '${quote(name)}'"
       case DropRef(name, true) => s"$alter DROP VERSION_TAG ${quoteIdentifier(name)}"
       case FastForward(to) => s"$alter AT(BRANCH => 'main') MERGE BRANCH '${quote(to)}'"
