@@ -41,7 +41,10 @@ private object SnowflakeFallbackCatalog {
     "metadata_log_entries", "snapshots", "refs", "manifests", "partitions", "all_data_files",
     "all_delete_files", "all_files", "all_manifests", "all_entries", "position_deletes")
   // Options of this catalog that Iceberg must not see
-  val SnowflakeOptions = Set("catalog-impl", "snowflake-database")
+  val SnowflakeOptions = Set("catalog-impl", "snowflake-database", "snowflake-fallback-mode")
+  // snowflake-fallback-mode: v1 (default) returns a read-only V1Table for a protected table;
+  // iceberg returns a SnowflakeSparkTable, which also takes Iceberg DDL, procedures and writes
+  val FallbackModes = Set("v1", "iceberg")
 }
 
 /**
@@ -58,6 +61,7 @@ class SnowflakeFallbackCatalog extends SparkCatalog {
   private var catalogName: String = _
   private var snowflakeDatabase: Option[String] = None
   private var warehouse: Option[String] = None
+  private var icebergFallback = false
 
   override protected def buildIcebergCatalog(
       name: String, options: CaseInsensitiveStringMap): Catalog =
@@ -75,6 +79,10 @@ class SnowflakeFallbackCatalog extends SparkCatalog {
       Option(options.get("snowflake-database")).map(_.trim).filter(_.nonEmpty)
     // Horizon IRC maps the Iceberg warehouse to the Snowflake database
     this.warehouse = Option(options.get("warehouse")).map(_.trim).filter(_.nonEmpty)
+    val mode = Option(options.get("snowflake-fallback-mode")).map(_.trim.toLowerCase).getOrElse("v1")
+    require(FallbackModes.contains(mode), s"Catalog '$name': snowflake-fallback-mode must be one " +
+      s"of ${FallbackModes.mkString(", ")}, got $mode")
+    this.icebergFallback = mode == "iceberg"
     log.info("Initializing SnowflakeFallbackCatalog: {}", name)
 
     // Before this catalog extended SparkCatalog, catalog-impl named the delegate SparkCatalog
@@ -153,7 +161,8 @@ class SnowflakeFallbackCatalog extends SparkCatalog {
       ident: Identifier, spec: Option[IcebergTimeTravel.Spec], original: Throwable): Table = {
     log.info(s"403 Forbidden detected for ${ident}, attempting JDBC fallback")
     try {
-      createSnowflakeV1Table(ident, spec)
+      if (icebergFallback) createSnowflakeSparkTable(ident, spec)
+      else createSnowflakeV1Table(ident, spec)
     } catch {
       case fallbackEx: Throwable =>
         // rethrow original exception if fallback also fails
@@ -390,6 +399,54 @@ class SnowflakeFallbackCatalog extends SparkCatalog {
       }
     }
 
+    val (properties, _) = snowflakeParameters(ident, timeTravel)
+    val storage = CatalogStorageFormat(
+      locationUri = None,
+      inputFormat = None,
+      outputFormat = None,
+      serde = None,
+      compressed = false,
+      properties = properties
+    )
+
+    // Use reflection-based creation to ensure compatibility across Spark versions
+    val catalogTable = createCatalogTableWithReflection(
+      tableIdentifier = tableIdentifier,
+      tableType = CatalogTableType.EXTERNAL,
+      storage = storage,
+      schema = StructType(Seq.empty), // Empty schema, V1Table will use its own schema
+      provider = Some(classOf[FallbackDefaultSource].getName),
+      partitionColumnNames = Seq.empty,
+      bucketSpec = None
+    )
+
+    new V1Table(catalogTable)
+  }
+
+  /** A protected table as an Iceberg SparkTable backed by Snowflake (snowflake-fallback-mode). */
+  private def createSnowflakeSparkTable(
+      ident: Identifier, timeTravel: Option[IcebergTimeTravel.Spec]): Table = {
+    val (params, fullTableName) = snowflakeParameters(ident, timeTravel)
+    val sql = newSnowflakeSql(params)
+    lazy val sparkTable: SnowflakeSparkTable = new SnowflakeSparkTable(
+      new SnowflakeIcebergTable((catalogName +: ident.namespace() :+ ident.name()).mkString("."),
+        fullTableName, sparkTable.schema(), sql),
+      params, timeTravel)
+    sparkTable
+  }
+
+  protected def newSnowflakeSql(params: Map[String, String]): SnowflakeSql =
+    new JdbcSnowflakeSql(params)
+
+  /**
+   * The Snowflake connector parameters for a protected table (credentials from SparkConf only,
+   * dbtable, or query for a time travel read), and its Snowflake name.
+   */
+  private def snowflakeParameters(
+      ident: Identifier, timeTravel: Option[IcebergTimeTravel.Spec]): (Map[String, String], String) = {
+    val spark = org.apache.spark.sql.SparkSession.getActiveSession.getOrElse(
+      throw new IllegalStateException("No active SparkSession found")
+    )
     val allConfs =
       spark.sparkContext.getConf.getAll.toMap  // Hardening: use ONLY immutable SparkConf; spark.conf/sessionState.conf are runtime SQLConf settable via SET and must not feed privileged connector options  // Hardening: sessionState.conf removed — it is user-mutable via SET and must not be merged into privileged connector options
 
@@ -414,30 +471,10 @@ class SnowflakeFallbackCatalog extends SparkCatalog {
     val database = resolveDatabase(snowflakeProps.get(Parameters.PARAM_SF_DATABASE))
     val fullTableName = buildFullTableName(ident, database)
 
-    val storage = CatalogStorageFormat(
-      locationUri = None,
-      inputFormat = None,
-      outputFormat = None,
-      serde = None,
-      compressed = false,
-      properties = database.map(Parameters.PARAM_SF_DATABASE -> _).toMap ++
-        snowflakeProps +
-        timeTravel.fold(Parameters.PARAM_SF_DBTABLE -> fullTableName)(spec =>
-          Parameters.PARAM_SF_QUERY -> IcebergTimeTravel.query(fullTableName, spec))
-    )
-
-    // Use reflection-based creation to ensure compatibility across Spark versions
-    val catalogTable = createCatalogTableWithReflection(
-      tableIdentifier = tableIdentifier,
-      tableType = CatalogTableType.EXTERNAL,
-      storage = storage,
-      schema = StructType(Seq.empty), // Empty schema, V1Table will use its own schema
-      provider = Some(classOf[FallbackDefaultSource].getName),
-      partitionColumnNames = Seq.empty,
-      bucketSpec = None
-    )
-
-    new V1Table(catalogTable)
+    (database.map(Parameters.PARAM_SF_DATABASE -> _).toMap ++ snowflakeProps +
+      timeTravel.fold(Parameters.PARAM_SF_DBTABLE -> fullTableName)(spec =>
+        Parameters.PARAM_SF_QUERY -> IcebergTimeTravel.query(fullTableName, spec)),
+      fullTableName)
   }
 
 
