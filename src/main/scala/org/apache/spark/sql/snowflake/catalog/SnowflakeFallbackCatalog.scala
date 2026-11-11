@@ -473,7 +473,13 @@ class SnowflakeFallbackCatalog extends SparkCatalog {
 
     (database.map(Parameters.PARAM_SF_DATABASE -> _).toMap ++ snowflakeProps +
       timeTravel.fold(Parameters.PARAM_SF_DBTABLE -> fullTableName)(spec =>
-        Parameters.PARAM_SF_QUERY -> IcebergTimeTravel.query(fullTableName, spec)),
+        Parameters.PARAM_SF_QUERY -> IcebergTimeTravel.query(fullTableName, spec)) ++
+      // Iceberg's refs columns are lowercase; the connector would otherwise quote them ("name")
+      (if (timeTravel.contains(IcebergTimeTravel.Refs)) {
+        Map(Parameters.PARAM_KEEP_COLUMN_CASE -> "on")
+      } else {
+        Map.empty
+      }),
       fullTableName)
   }
 

@@ -93,8 +93,9 @@ private[catalog] class FallbackRelation(
     relation.buildScan(requiredColumns, filters)
 
   override def insert(data: DataFrame, overwrite: Boolean): Unit = {
+    val conf = sqlContext.sparkSession.conf
     IcebergTimeTravel.checkWrite(
-      timeTravel, sqlContext.sparkSession.conf.getOption("spark.wap.branch"))
+      timeTravel, conf.getOption("spark.wap.branch"), conf.getOption("spark.wap.id"))
     relation.insert(data, overwrite)
   }
 

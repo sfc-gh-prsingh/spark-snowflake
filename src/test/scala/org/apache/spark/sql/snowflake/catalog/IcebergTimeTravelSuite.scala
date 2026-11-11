@@ -202,6 +202,13 @@ class IcebergTimeTravelSuite extends AnyFunSuite with BeforeAndAfterAll {
     assert(e.getMessage.contains("spark.wap.branch=audit"))
   }
 
+  test("writes to a fallback table with spark.wap.id set fail instead of writing main") {
+    IcebergTimeTravel.checkWrite(timeTravel = false, None, Some(""))
+    val e = intercept[UnsupportedOperationException](
+      IcebergTimeTravel.checkWrite(timeTravel = false, None, Some("w1")))
+    assert(e.getMessage.contains("spark.wap.id=w1"))
+  }
+
   test("with spark.wap.branch set, a plain read reads the WAP branch once it exists") {
     withWapBranch("dev") {
       val source = new StubRefsSource(Set("dev"))

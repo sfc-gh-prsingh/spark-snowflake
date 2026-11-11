@@ -152,7 +152,15 @@ private[catalog] object IcebergTimeTravel {
    * Branch writes have no Snowflake SQL equivalent, so they fail instead of writing main.
    * timeTravel: the relation reads a branch, tag or snapshot (its parameters have a query).
    */
-  def checkWrite(timeTravel: Boolean, wapBranch: Option[String]): Unit = {
+  def checkWrite(
+      timeTravel: Boolean, wapBranch: Option[String], wapId: Option[String] = None): Unit = {
+    // Iceberg stages the snapshot of a spark.wap.id write without publishing it; Snowflake can't
+    wapId.filter(_.nonEmpty).foreach { id =>
+      throw new UnsupportedOperationException(
+        s"spark.wap.id=$id is set, but writes to a policy-protected table go through Snowflake, " +
+          "which cannot stage an unpublished snapshot. Unset spark.wap.id to write to the main " +
+          "branch.")
+    }
     // Checked first: with spark.wap.branch set, a read of the table is itself a branch read
     wapBranch.filter(b => b.nonEmpty && b != MainBranch).foreach { branch =>
       throw new UnsupportedOperationException(
