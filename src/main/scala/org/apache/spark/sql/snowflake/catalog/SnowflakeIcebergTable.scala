@@ -147,7 +147,8 @@ private[catalog] class SnowflakeIcebergTable(
         "writes it through Snowflake")
 
   // Iceberg's actions (expire_snapshots, rewrite_*) cast to HasTableOperations first
-  override def operations(): TableOperations = unsupported("Iceberg table maintenance")
+  override def operations(): TableOperations =
+    unsupported("Iceberg file-level operations (MERGE, UPDATE, table maintenance)")
   override def newScan(): TableScan = unsupported("An Iceberg file scan")
   override def updateSchema(): UpdateSchema = unsupported("Iceberg schema evolution")
   override def updateSpec(): UpdatePartitionSpec = unsupported("Iceberg partition evolution")
