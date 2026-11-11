@@ -121,8 +121,10 @@ private[catalog] class SnowflakeSparkTable(
   }
 
   /**
-   * Loads the rows into a staging table with the regular Snowflake writer, then inserts them into
-   * the target branch: COPY can't target an Iceberg branch, INSERT ... AT(BRANCH) can.
+   * Loads the rows into a staging table, then inserts them into the target branch: COPY can't
+   * target an Iceberg branch, INSERT ... AT(BRANCH) can. The staging table is loaded with the
+   * regular Snowflake writer, or with JDBC batch inserts where the account's stage type isn't
+   * supported by the writer (a local deployment's file-system stage).
    */
   private def write(data: DataFrame, overwrite: Boolean): Unit = {
     val branch = writeBranch()
@@ -134,7 +136,14 @@ private[catalog] class SnowflakeSparkTable(
     }
     val writeParams = params - Parameters.PARAM_SF_QUERY + (Parameters.PARAM_SF_DBTABLE -> staging)
     try {
-      new DefaultSource().createRelation(spark.sqlContext, SaveMode.Overwrite, writeParams, data)
+      // The target's columns, in its order: Spark has already aligned the rows to them
+      table.sql.execute(s"CREATE TABLE $staging AS SELECT * FROM $dbtable WHERE 1 = 0")
+      try {
+        new DefaultSource().createRelation(spark.sqlContext, SaveMode.Append, writeParams, data)
+      } catch {
+        case e: UnsupportedOperationException if String.valueOf(e.getMessage).contains("stage") =>
+          SnowflakeSparkTable.insertWithJdbc(data, writeParams, staging)
+      }
       val alter = s"ALTER ICEBERG TABLE $dbtable"
       // Iceberg creates the WAP branch on its first write
       if (timeTravel.isEmpty) {
@@ -148,6 +157,35 @@ private[catalog] class SnowflakeSparkTable(
       table.refresh()
     } finally {
       table.sql.execute(s"DROP TABLE IF EXISTS $staging")
+    }
+  }
+}
+
+private[catalog] object SnowflakeSparkTable {
+  private val BatchSize = 1000
+
+  /** Executors insert their partition's rows over JDBC, in batches. */
+  def insertWithJdbc(data: DataFrame, params: Map[String, String], staging: String): Unit = {
+    val columns = data.schema.length
+    val insert = s"INSERT INTO $staging VALUES (${Seq.fill(columns)("?").mkString(", ")})"
+    data.foreachPartition { (rows: Iterator[Row]) =>
+      val conn = net.snowflake.spark.snowflake.Utils.getJDBCConnection(params)
+      try {
+        val ps = conn.prepareStatement(insert)
+        rows.grouped(BatchSize).foreach { batch =>
+          batch.foreach { row =>
+            (0 until columns).foreach { i =>
+              if (row.isNullAt(i)) ps.setNull(i + 1, java.sql.Types.NULL)
+              else ps.setObject(i + 1, row.get(i))
+            }
+            ps.addBatch()
+          }
+          ps.executeBatch()
+        }
+        ps.close()
+      } finally {
+        conn.close()
+      }
     }
   }
 }
