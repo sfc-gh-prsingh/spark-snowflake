@@ -139,7 +139,13 @@ class SnowflakeFallbackCatalogTimeTravelTest extends AnyFunSuite with BeforeAndA
     for ((name, dbtable) <- Seq("fb" -> "MYDB.db.secret", "fbnowh" -> "db.secret")) {
       val table = catalog(name).loadTable(Identifier.of(Array("db", "secret"), "refs"))
       assert(queryOf(table) == IcebergTimeTravel.query(dbtable, IcebergTimeTravel.Refs), name)
+      // Iceberg's lowercase column names, not "name"
+      assert(snowflakeTable(table).catalogTable.storage.properties.get("keep_column_case")
+        .contains("on"), name)
     }
+    // Other reads keep the connector's default
+    val branch = catalog().loadTable(Identifier.of(Array("db", "secret"), "branch_x"))
+    assert(!snowflakeTable(branch).catalogTable.storage.properties.contains("keep_column_case"))
     // Its relation is cached apart from the table's
     val refs = catalog().loadTable(Identifier.of(Array("db", "secret"), "refs"))
     assert(snowflakeTable(refs).catalogTable.identifier.catalog != Some("fb"))
