@@ -77,6 +77,16 @@ class SnowflakeFallbackCatalogTest extends AnyFunSuite {
     assert(!forbidden(new RuntimeException("Some other error")))
   }
 
+  test("isForbiddenException should not match 403 inside a longer number or a not-found error") {
+    assert(forbidden(new RuntimeException("Server responded with status 403")))
+    assert(forbidden(new RuntimeException("wrapper", new RuntimeException("(403)"))))
+    assert(!forbidden(new RuntimeException("Request 4031 failed after 14030 ms")))
+    assert(!forbidden(new org.apache.spark.sql.catalyst.analysis.NoSuchTableException(
+      Identifier.of(Array("db", "secret"), "snapshot_id_5010424037564433155"))))
+    assert(!forbidden(new org.apache.iceberg.exceptions.NoSuchTableException(
+      "Table does not exist: db.sales_2403")))
+  }
+
   test("the catalog is an Iceberg SparkCatalog") {
     // Iceberg plans branch/tag DDL and procedures only for SparkCatalog instances
     assert(classOf[SparkCatalog].isAssignableFrom(classOf[SnowflakeFallbackCatalog]))

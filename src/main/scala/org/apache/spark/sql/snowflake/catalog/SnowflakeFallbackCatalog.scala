@@ -40,6 +40,8 @@ private object SnowflakeFallbackCatalog {
   val IcebergMetadataTables = Set("entries", "files", "data_files", "delete_files", "history",
     "metadata_log_entries", "snapshots", "refs", "manifests", "partitions", "all_data_files",
     "all_delete_files", "all_files", "all_manifests", "all_entries", "position_deletes")
+  // An HTTP 403 in an error message, not 403 inside a longer number
+  val StatusCode403 = "(?<![0-9])403(?![0-9])".r
   // Options of this catalog that Iceberg must not see
   val SnowflakeOptions = Set("catalog-impl", "snowflake-database")
 }
@@ -229,10 +231,18 @@ class SnowflakeFallbackCatalog extends SparkCatalog {
     if (exceptionClass.contains("ForbiddenException")) {
       return true
     }
+    // A not-found error is never a 403, even when the name it reports has 403 in it
+    // (db.t.snapshot_id_1403, sales_2403)
+    if (ex.isInstanceOf[NoSuchTableException] ||
+        ex.isInstanceOf[org.apache.iceberg.exceptions.NoSuchTableException]) {
+      return false
+    }
 
-    // Fallback to message checking for other exception types
-    (message.contains("403") || message.contains("Forbidden")) ||
-    causeMessage.contains("403") || causeMessage.contains("Forbidden")
+    // Fallback to message checking for other exception types; 403 as a status code, not digits
+    // inside a longer number
+    def mentions403(text: String): Boolean =
+      StatusCode403.findFirstIn(text).isDefined || text.contains("Forbidden")
+    mentions403(message) || mentions403(causeMessage)
   }
 
   private[snowflake] def resolveDatabase(sessionDatabase: Option[String]): Option[String] =

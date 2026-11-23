@@ -121,6 +121,8 @@ class SnowflakeFallbackCatalogTimeTravelTest extends AnyFunSuite with BeforeAndA
       "branch_x" -> "AT(BRANCH => 'x')",
       "tag_t" -> "AT(VERSION_REF => 't')",
       s"snapshot_id_$snapshotId" -> s"AT(VERSION => $snapshotId)",
+      // A snapshot ID with 403 in it is still a selector, not a 403 (it was flaky with random IDs)
+      "snapshot_id_5010424037564433155" -> "AT(VERSION => 5010424037564433155)",
       "at_timestamp_1764547200000" -> "AT(TIMESTAMP => TO_TIMESTAMP_LTZ(1764547200000000, 6))")
     for ((name, clause) <- cases) {
       val table = catalog().loadTable(Identifier.of(Array("db", "secret"), name))
