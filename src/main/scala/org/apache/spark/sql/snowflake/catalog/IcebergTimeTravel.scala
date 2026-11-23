@@ -18,6 +18,9 @@ package org.apache.spark.sql.snowflake.catalog
 import java.util.Locale
 
 import net.snowflake.spark.snowflake.Parameters
+import org.apache.iceberg.SnapshotRef
+import org.apache.iceberg.spark.{SparkReadOptions, SparkSQLProperties}
+import org.apache.spark.sql.RuntimeConfig
 import org.apache.spark.sql.catalyst.util.DateTimeUtils
 import org.apache.spark.sql.internal.SQLConf
 import org.apache.spark.unsafe.types.UTF8String
@@ -28,19 +31,28 @@ import org.apache.spark.unsafe.types.UTF8String
  */
 private[catalog] object IcebergTimeTravel {
 
-  /** A read of a fallback table that Snowflake answers with a query instead of dbtable. */
+  /** What a read of a fallback table reads: the current table, or a version of it. */
   sealed trait Spec {
-    /** Distinguishes the read in the table's relation cache key. */
     def clause: String
     def query(dbtable: String): String = s"SELECT * FROM $dbtable $clause"
+    /** Connector parameters that read `dbtable` at this spec. */
+    def readParameters(dbtable: String): Map[String, String] =
+      Map(Parameters.PARAM_SF_QUERY -> query(dbtable))
+  }
+
+  /** The table's current state (Iceberg's main), read from dbtable without an AT clause. */
+  case object Main extends Spec {
+    def clause: String = ""
+    override def query(dbtable: String): String = s"SELECT * FROM $dbtable"
+    override def readParameters(dbtable: String): Map[String, String] =
+      Map(Parameters.PARAM_SF_DBTABLE -> dbtable)
   }
 
   final case class Snapshot(id: Long) extends Spec {
     def clause: String = s"AT(VERSION => $id)"
   }
 
-  /** A branch or tag; Snowflake's VERSION_REF resolves either. */
-  final case class Ref(name: String) extends Spec {
+  final case class Tag(name: String) extends Spec {
     def clause: String = s"AT(VERSION_REF => '${quote(name)}')"
   }
 
@@ -50,6 +62,14 @@ private[catalog] object IcebergTimeTravel {
    */
   final case class Branch(name: String) extends Spec {
     def clause: String = s"AT(BRANCH => '${quote(name)}')"
+  }
+
+  /**
+   * VERSION AS OF '<name>': a branch or a tag, which `resolve` tells apart from the table's refs.
+   * Unresolved, Snowflake's VERSION_REF reads either.
+   */
+  final case class Named(name: String) extends Spec {
+    def clause: String = s"AT(VERSION_REF => '${quote(name)}')"
   }
 
   final case class TimestampMicros(micros: Long) extends Spec {
@@ -70,105 +90,112 @@ private[catalog] object IcebergTimeTravel {
         s""""max_snapshot_age_in_ms" FROM TABLE($infoSchema.GET_TABLE_VERSION_REFS(""" +
         s"""TABLE_NAME => '${quote(dbtable)}'))"""
     }
+    // Iceberg's refs columns are lowercase; the connector would otherwise quote them ("name")
+    override def readParameters(dbtable: String): Map[String, String] =
+      super.readParameters(dbtable) + (Parameters.PARAM_KEEP_COLUMN_CASE -> "on")
   }
 
-  // Iceberg's SnapshotRef.MAIN_BRANCH; ref names are case-sensitive in Iceberg
-  val MainBranch = "main"
+  /** Main for main (Snowflake rejects AT(VERSION_REF => 'main')); ref names are case-sensitive. */
+  private def unlessMain(name: String)(spec: String => Spec): Spec =
+    if (name == SnapshotRef.MAIN_BRANCH) Main else spec(name)
 
-  /**
-   * A branch or tag read. None for main: it is the table's current state, and Snowflake rejects
-   * AT(VERSION_REF => 'main'), so main is read without an AT clause.
-   */
-  def fromRef(name: String): Option[Spec] = if (name == MainBranch) None else Some(Ref(name))
+  def fromBranch(name: String): Spec = unlessMain(name)(Branch)
 
-  /** A read known to be of a branch; None for main, as in fromRef. */
-  def fromBranch(name: String): Option[Spec] = if (name == MainBranch) None else Some(Branch(name))
+  def fromTag(name: String): Spec = unlessMain(name)(Tag)
 
   /** Spark's VERSION AS OF: a snapshot ID if numeric, otherwise a branch or tag (as Iceberg). */
-  def fromVersion(version: String): Option[Spec] =
-    if (version.nonEmpty && version.forall(_.isDigit)) Some(Snapshot(version.toLong))
-    else fromRef(version)
+  def fromVersion(version: String): Spec =
+    if (version.nonEmpty && version.forall(_.isDigit)) Snapshot(version.toLong)
+    else unlessMain(version)(Named)
 
+  /** VERSION AS OF '<name>' as a branch or tag read, given the table's refs (name -> type). */
+  def resolve(spec: Spec, refTypes: => Map[String, String]): Spec = spec match {
+    case Named(name) if refTypes.get(name).contains("BRANCH") => Branch(name)
+    case Named(name) => Tag(name)
+    case other => other
+  }
+
+  // Literals: Iceberg 1.11 renamed these SparkReadOptions constants (LEGACY_SNAPSHOT_ID, ...), so
+  // no one name compiles against both Iceberg versions this connector builds with
   private val SnapshotId = "snapshot-id"
   private val AsOfTimestamp = "as-of-timestamp"
-  private val BranchOption = "branch"
-  private val Tag = "tag"
+  private val TagOption = "tag"
+  private val BranchOption = SparkReadOptions.BRANCH
   // Spark's own read options; on 4.x Spark turns them into loadTable(ident, version|timestamp)
-  private val VersionAsOf = "versionasof"
-  private val TimestampAsOf = "timestampasof"
+  private val VersionAsOf = SparkReadOptions.VERSION_AS_OF.toLowerCase(Locale.ROOT)
+  private val TimestampAsOf = SparkReadOptions.TIMESTAMP_AS_OF.toLowerCase(Locale.ROOT)
   private val ReadOptions =
-    Seq(SnapshotId, AsOfTimestamp, BranchOption, Tag, VersionAsOf, TimestampAsOf)
+    Seq(SnapshotId, AsOfTimestamp, BranchOption, TagOption, VersionAsOf, TimestampAsOf)
 
-  private def fromOption(key: String, value: String): Option[Spec] = key match {
-    case SnapshotId => Some(Snapshot(value.trim.toLong))
-    case AsOfTimestamp => Some(TimestampMicros(Math.multiplyExact(value.trim.toLong, 1000L)))
+  private def fromOption(key: String, value: String): Spec = key match {
+    case SnapshotId => Snapshot(value.trim.toLong)
+    case AsOfTimestamp => TimestampMicros(Math.multiplyExact(value.trim.toLong, 1000L))
     case BranchOption => fromBranch(value)
-    case Tag => Some(Ref(value))
+    case TagOption => fromTag(value)
     case VersionAsOf => fromVersion(value.trim)
     case TimestampAsOf =>
       val zone = DateTimeUtils.getZoneId(SQLConf.get.sessionLocalTimeZone)
-      Some(TimestampMicros(DateTimeUtils.stringToTimestamp(UTF8String.fromString(value.trim), zone)
-        .getOrElse(throw new IllegalArgumentException(s"Invalid timestampAsOf: $value"))))
+      TimestampMicros(DateTimeUtils.stringToTimestamp(UTF8String.fromString(value.trim), zone)
+        .getOrElse(throw new IllegalArgumentException(s"Invalid timestampAsOf: $value")))
   }
 
-  private def quote(name: String): String = name.replace("'", "''")
-
-  def query(dbtable: String, spec: Spec): String = spec.query(dbtable)
-
-  /** Lists the branch if the table's refs have it. */
-  def branchExistsQuery(dbtable: String, branch: String): String =
-    s"""SELECT 1 FROM (${Refs.query(dbtable)}) WHERE "name" = '${quote(branch)}' AND "type" = 'BRANCH'"""
-
-  /** spark.wap.branch, unless unset or main. */
-  def wapBranch(conf: org.apache.spark.sql.RuntimeConfig): Option[String] =
-    conf.getOption("spark.wap.branch").filter(b => b.nonEmpty && b != MainBranch)
-
   /**
-   * Rewrites the read parameters of a fallback table: a time travel read option becomes a query
-   * with the matching AT clause.
+   * What a read with these options reads, for a table the catalog loaded at `loaded`: a time
+   * travel read option applies to a table loaded at its current state.
    */
-  def rewriteReadParameters(parameters: Map[String, String]): Map[String, String] = {
-    val params = parameters.map { case (k, v) => k.toLowerCase(Locale.ROOT) -> v }
-    val requested = ReadOptions.filter(params.contains)
-    val base = params -- ReadOptions
-    (requested, base.get(Parameters.PARAM_SF_QUERY)) match {
-      case (Seq(), _) => base
-      // The catalog already applied Spark's VERSION/TIMESTAMP AS OF to the query
-      case (keys, Some(_)) if keys.forall(k => k == VersionAsOf || k == TimestampAsOf) => base
-      case (Seq(key), None) =>
-        fromOption(key, params(key)).fold(base) { spec =>
-          val dbtable = base.getOrElse(Parameters.PARAM_SF_DBTABLE,
-            throw new IllegalArgumentException(s"Time travel option '$key' requires dbtable"))
-          base - Parameters.PARAM_SF_DBTABLE + (Parameters.PARAM_SF_QUERY -> query(dbtable, spec))
-        }
-      case (keys, _) =>
+  def readSpec(loaded: Spec, options: Map[String, String]): Spec = {
+    val params = options.map { case (k, v) => k.toLowerCase(Locale.ROOT) -> v }
+    ReadOptions.filter(params.contains) match {
+      case Seq() => loaded
+      // On 4.x, Spark passes VERSION/TIMESTAMP AS OF both to loadTable and as options
+      case keys if loaded != Main && keys.forall(k => k == VersionAsOf || k == TimestampAsOf) =>
+        loaded
+      case Seq(key) if loaded == Main => fromOption(key, params(key))
+      case keys =>
         throw new IllegalArgumentException(
           s"Cannot combine time travel options ${keys.mkString(", ")} with each other " +
             "or with VERSION AS OF / TIMESTAMP AS OF")
     }
   }
 
+  /** Read options other than time travel ones, which the connector receives as is. */
+  def withoutReadOptions(options: Map[String, String]): Map[String, String] =
+    options.filter { case (k, _) => !ReadOptions.contains(k.toLowerCase(Locale.ROOT)) }
+
+  private def quote(name: String): String = name.replace("'", "''")
+
+  /** The table's refs as (name, type) rows. */
+  def refTypesQuery(dbtable: String): String =
+    s"""SELECT "name", "type" FROM (${Refs.query(dbtable)})"""
+
+  /** spark.wap.branch, unless unset or main. */
+  def wapBranch(conf: RuntimeConfig): Option[String] =
+    conf.getOption(SparkSQLProperties.WAP_BRANCH)
+      .filter(b => b.nonEmpty && b != SnapshotRef.MAIN_BRANCH)
+
+  /** spark.wap.id, unless unset. */
+  def wapId(conf: RuntimeConfig): Option[String] =
+    conf.getOption(SparkSQLProperties.WAP_ID).filter(_.nonEmpty)
+
   /**
    * Branch writes have no Snowflake SQL equivalent, so they fail instead of writing main.
-   * timeTravel: the relation reads a branch, tag or snapshot (its parameters have a query).
+   * spec: what the written table was loaded at; only Main takes writes.
    */
-  def checkWrite(
-      timeTravel: Boolean, wapBranch: Option[String], wapId: Option[String] = None): Unit = {
+  def checkWrite(spec: Spec, wapBranch: Option[String], wapId: Option[String]): Unit = {
     // Iceberg stages the snapshot of a spark.wap.id write without publishing it; Snowflake can't
-    wapId.filter(_.nonEmpty).foreach { id =>
+    wapId.foreach { id =>
       throw new UnsupportedOperationException(
         s"spark.wap.id=$id is set, but writes to a policy-protected table go through Snowflake, " +
           "which cannot stage an unpublished snapshot. Unset spark.wap.id to write to the main " +
           "branch.")
     }
-    // Checked first: with spark.wap.branch set, a read of the table is itself a branch read
-    wapBranch.filter(b => b.nonEmpty && b != MainBranch).foreach { branch =>
+    wapBranch.foreach { branch =>
       throw new UnsupportedOperationException(
         s"spark.wap.branch=$branch is set, but writes to a policy-protected table go " +
           "through Snowflake, which cannot write to an Iceberg branch. Unset spark.wap.branch " +
           "to write to the main branch.")
     }
-    if (timeTravel) {
+    if (spec != Main) {
       throw new UnsupportedOperationException(
         "Cannot write to an Iceberg branch, tag or snapshot of a table read through " +
           "Snowflake (policy-protected table)")

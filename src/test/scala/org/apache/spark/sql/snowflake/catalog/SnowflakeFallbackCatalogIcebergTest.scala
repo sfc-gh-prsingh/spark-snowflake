@@ -19,34 +19,21 @@ package org.apache.spark.sql.snowflake.catalog
 import java.nio.file.Files
 
 import org.apache.spark.sql.SparkSession
-import org.scalatest.BeforeAndAfterAll
 import org.scalatest.funsuite.AnyFunSuite
 
-class SnowflakeFallbackCatalogIcebergTest extends AnyFunSuite with BeforeAndAfterAll {
+class SnowflakeFallbackCatalogIcebergTest extends AnyFunSuite with LocalSparkSuite {
 
-  private var spark: SparkSession = _
-
-  override def beforeAll(): Unit = {
-    val warehouse = Files.createTempDirectory("fallback-iceberg").toUri.toString
-    // spark.sql.extensions is static: stop any session leaked by an earlier suite in this JVM
-    SparkSession.getActiveSession.foreach(_.stop())
-    SparkSession.getDefaultSession.foreach(_.stop())
-    spark = SparkSession.builder()
-      .master("local[1]")
-      .config("spark.ui.enabled", "false")
-      // Iceberg probes optional classes on executors; don't route misses to the artifact server
-      .config("spark.sql.artifact.isolation.enabled", "false")
-      // Only Iceberg's extensions, as for Iceberg's own SparkCatalog
-      .config("spark.sql.extensions",
-        "org.apache.iceberg.spark.extensions.IcebergSparkSessionExtensions")
+  override protected def configure(builder: SparkSession.Builder): SparkSession.Builder =
+    LocalSparkSuite.withIceberg(builder)
       .config("spark.sql.catalog.fb", classOf[SnowflakeFallbackCatalog].getName)
       .config("spark.sql.catalog.fb.type", "hadoop")
-      .config("spark.sql.catalog.fb.warehouse", warehouse)
-      .getOrCreate()
+      .config("spark.sql.catalog.fb.warehouse",
+        Files.createTempDirectory("fallback-iceberg").toUri.toString)
+
+  override def beforeAll(): Unit = {
+    super.beforeAll()
     spark.sql("CREATE NAMESPACE IF NOT EXISTS fb.db")
   }
-
-  override def afterAll(): Unit = if (spark != null) spark.stop()
 
   private def count(sql: String): Long = spark.sql(sql).collect().head.getLong(0)
 

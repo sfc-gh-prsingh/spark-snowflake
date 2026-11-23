@@ -18,11 +18,13 @@ package org.apache.spark.sql.snowflake.catalog
 
 import java.nio.file.Files
 
+import org.apache.iceberg.exceptions.ForbiddenException
 import org.apache.iceberg.spark.SparkCatalog
 import org.apache.iceberg.spark.source.SparkTable
 import org.apache.spark.SPARK_VERSION
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.connector.catalog._
+import org.apache.spark.sql.snowflake.catalog.LocalSparkSuite.fallbackTable
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 import org.scalatest.funsuite.AnyFunSuite
 import scala.collection.JavaConverters._
@@ -65,26 +67,21 @@ class SnowflakeFallbackCatalogTest extends AnyFunSuite {
     method.invoke(catalog, ex).asInstanceOf[Boolean]
   }
 
-  test("isForbiddenException should detect 403 in exception message") {
-    assert(forbidden(new RuntimeException("HTTP 403 Forbidden")))
+  test("isForbiddenException detects Iceberg's ForbiddenException, also when wrapped") {
+    val forbiddenEx = new ForbiddenException("Forbidden: Access to table %s is denied", "db.t")
+    assert(forbidden(forbiddenEx))
+    assert(forbidden(new RuntimeException("wrapper", forbiddenEx)))
+    assert(forbidden(new RuntimeException("a", new IllegalStateException("b", forbiddenEx))))
   }
 
-  test("isForbiddenException should detect Forbidden in exception message") {
-    assert(forbidden(new RuntimeException("Access Forbidden")))
-  }
-
-  test("isForbiddenException should return false for other exceptions") {
+  test("isForbiddenException ignores 403 or Forbidden in other errors' messages") {
+    // Names and IDs in messages contain 403 (db.t.snapshot_id_5010424037564433155, sales_403)
     assert(!forbidden(new RuntimeException("Some other error")))
-  }
-
-  test("isForbiddenException should not match 403 inside a longer number or a not-found error") {
-    assert(forbidden(new RuntimeException("Server responded with status 403")))
-    assert(forbidden(new RuntimeException("wrapper", new RuntimeException("(403)"))))
-    assert(!forbidden(new RuntimeException("Request 4031 failed after 14030 ms")))
+    assert(!forbidden(new RuntimeException("HTTP 403 Forbidden")))
     assert(!forbidden(new org.apache.spark.sql.catalyst.analysis.NoSuchTableException(
       Identifier.of(Array("db", "secret"), "snapshot_id_5010424037564433155"))))
-    assert(!forbidden(new org.apache.iceberg.exceptions.NoSuchTableException(
-      "Table does not exist: db.sales_2403")))
+    assert(!forbidden(new org.apache.iceberg.exceptions.NoSuchNamespaceException(
+      "Namespace does not exist: sales_403")))
   }
 
   test("the catalog is an Iceberg SparkCatalog") {
@@ -104,7 +101,7 @@ class SnowflakeFallbackCatalogTest extends AnyFunSuite {
     }
   }
 
-  test("loadTable should attempt V1Table creation on 403") {
+  test("loadTable should fall back to a Snowflake table on 403") {
     withSpark(Map(
       "spark.snowflake.url" -> "test.snowflakecomputing.com",
       "spark.snowflake.user" -> "testuser",
@@ -114,15 +111,13 @@ class SnowflakeFallbackCatalogTest extends AnyFunSuite {
       val catalog = newCatalog("test_catalog", "forbidden-tables" -> "testschema.testtable")
       val result = catalog.loadTable(Identifier.of(Array("testschema"), "testtable"))
 
-      assert(result.isInstanceOf[V1Table], "Should return a V1Table instance")
-      val catalogTable = result.asInstanceOf[V1Table].catalogTable
-      assert(catalogTable.storage.properties.get("dbtable").contains("testschema.testtable"))
-      assert(catalogTable.storage.properties.get("url").contains("test.snowflakecomputing.com"),
+      val table = fallbackTable(result)
+      assert(table.dbtable == "testschema.testtable")
+      assert(table.spec == IcebergTimeTravel.Main)
+      assert(table.params.get("url").contains("test.snowflakecomputing.com"),
         "Should have url from SparkSession config")
-      assert(catalogTable.storage.properties.get("user").contains("testuser"),
+      assert(table.params.get("user").contains("testuser"),
         "Should have user from SparkSession config")
-      assert(catalogTable.provider.contains(classOf[FallbackDefaultSource].getName),
-        "Should have the fallback Snowflake source as provider")
     }
   }
 
@@ -142,16 +137,25 @@ class SnowflakeFallbackCatalogTest extends AnyFunSuite {
     }
   }
 
-  test("catalog-impl may only name Iceberg's SparkCatalog") {
+  test("catalog-impl from before the catalog extended SparkCatalog") {
     withSpark() { _ =>
-      // Configuration from before the catalog extended SparkCatalog keeps working
+      // Naming SparkCatalog (the old delegate) is redundant and keeps working
       val legacy = newCatalog("test", "catalog-impl" -> classOf[SparkCatalog].getName)
       assert(legacy.icebergOptions.get("catalog-impl") == null)
 
+      // Any other Spark catalog can no longer be the delegate
       val thrown = intercept[IllegalArgumentException] {
-        newCatalog("test", "catalog-impl" -> "com.example.OtherCatalog")
+        newCatalog("test", "catalog-impl" -> "org.apache.iceberg.spark.SparkSessionCatalog")
       }
-      assert(thrown.getMessage.contains("catalog-impl"))
+      assert(thrown.getMessage.contains("catalog-impl") && thrown.getMessage.contains("type"))
+    }
+  }
+
+  test("catalog-impl naming an Iceberg Catalog configures Iceberg's catalog") {
+    withSpark() { _ =>
+      for (impl <- Seq("org.apache.iceberg.rest.RESTCatalog", "com.example.NotOnClasspath")) {
+        assert(newCatalog("test", "catalog-impl" -> impl).icebergOptions.get("catalog-impl") == impl)
+      }
     }
   }
 
@@ -194,6 +198,13 @@ class SnowflakeFallbackCatalogTest extends AnyFunSuite {
     }
   }
 
+  test("tableExists should return true for a protected table") {
+    withSpark() { _ =>
+      val catalog = newCatalog("test", "forbidden-tables" -> "schema.table")
+      assert(catalog.tableExists(Identifier.of(Array("schema"), "table")))
+    }
+  }
+
   test("dbtable property should be constructed from Identifier namespace and name") {
     // buildFullTableName is private[snowflake], so it is accessible to tests in this package
     val catalog = new SnowflakeFallbackCatalog()
@@ -220,22 +231,22 @@ class SnowflakeFallbackCatalogTest extends AnyFunSuite {
   }
 
   // Hardening: a runtime SQLConf value (what a Spark-SQL `SET` writes) must NOT
-  // leak into the privileged V1Table option map; only immutable SparkConf should flow.
-  test("runtime SQLConf values must not leak into V1Table properties (dbee43e2)") {
+  // leak into the privileged fallback connector options; only immutable SparkConf should flow.
+  test("runtime SQLConf values must not leak into fallback table options (dbee43e2)") {
     withSpark(Map(
       "spark.snowflake.url" -> "test.snowflakecomputing.com",
       "spark.snowflake.user" -> "testuser")) { spark =>
       // Simulate a malicious `SET snowflake.preactions=...` (writes to runtime SQLConf).
       spark.conf.set("snowflake.preactions", "GRANT ROLE ACCOUNTADMIN TO USER attacker")
       val catalog = newCatalog("test_catalog", "forbidden-tables" -> "testschema.testtable")
-      val props = catalog.loadTable(Identifier.of(Array("testschema"), "testtable"))
-        .asInstanceOf[V1Table].catalogTable.storage.properties
+      val props = fallbackTable(
+        catalog.loadTable(Identifier.of(Array("testschema"), "testtable"))).params
 
       assert(props.get("preactions").isEmpty,
-        s"runtime SET value leaked into V1Table properties: ${props.get("preactions")}")
+        s"runtime SET value leaked into fallback table options: ${props.get("preactions")}")
       // Legit admin SparkConf value must still flow through.
       assert(props.get("url").contains("test.snowflakecomputing.com"),
-        "admin SparkConf 'url' should still be present in V1Table properties")
+        "admin SparkConf 'url' should still be present in fallback table options")
     }
   }
 
@@ -320,8 +331,8 @@ class SnowflakeFallbackCatalogTest extends AnyFunSuite {
         : Map[String, String] = withSpark(sessionConf) { _ =>
       val catalog = newCatalog("alias",
         (catalogOptions + ("forbidden-tables" -> "MY_SCHEMA.MY_TABLE")).toSeq: _*)
-      catalog.loadTable(Identifier.of(Array("MY_SCHEMA"), "MY_TABLE"))
-        .asInstanceOf[V1Table].catalogTable.storage.properties
+      val table = fallbackTable(catalog.loadTable(Identifier.of(Array("MY_SCHEMA"), "MY_TABLE")))
+      table.params + ("dbtable" -> table.dbtable)
     }
 
     val defaulted = fallbackProps(Map.empty)
