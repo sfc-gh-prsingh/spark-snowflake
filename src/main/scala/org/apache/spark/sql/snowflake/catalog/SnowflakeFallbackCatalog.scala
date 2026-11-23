@@ -211,7 +211,6 @@ class SnowflakeFallbackCatalog extends SparkCatalog {
     }
   }
 
-
   private def isForbiddenException(ex: Throwable): Boolean = {
     val exceptionClass = ex.getClass.getName
     val message = if (ex.getMessage != null) ex.getMessage else ""
@@ -357,7 +356,6 @@ class SnowflakeFallbackCatalog extends SparkCatalog {
           s"This may indicate a Spark version compatibility issue.", ex)
     }
   }
-  
 
   private def createSnowflakeV1Table(
       ident: Identifier, timeTravel: Option[IcebergTimeTravel.Spec] = None): Table = {
@@ -439,8 +437,6 @@ class SnowflakeFallbackCatalog extends SparkCatalog {
 
     new V1Table(catalogTable)
   }
-
-
 
   override def tableExists(ident: Identifier): Boolean = {
     try {
