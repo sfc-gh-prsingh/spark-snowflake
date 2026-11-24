@@ -60,6 +60,8 @@ class SnowflakeFallbackCatalogTest extends AnyFunSuite {
     catalog
   }
 
+  private def name(dotted: String): SnowflakeTableName = SnowflakeTableName(dotted.split('.').toSeq)
+
   private def forbidden(ex: Throwable): Boolean = {
     val catalog = new SnowflakeFallbackCatalog()
     val method = catalog.getClass.getDeclaredMethod("isForbiddenException", classOf[Throwable])
@@ -112,7 +114,7 @@ class SnowflakeFallbackCatalogTest extends AnyFunSuite {
       val result = catalog.loadTable(Identifier.of(Array("testschema"), "testtable"))
 
       val table = fallbackTable(result)
-      assert(table.dbtable == "testschema.testtable")
+      assert(table.table == name("testschema.testtable"))
       assert(table.spec == IcebergTimeTravel.Main)
       assert(table.params.get("url").contains("test.snowflakecomputing.com"),
         "Should have url from SparkSession config")
@@ -212,22 +214,22 @@ class SnowflakeFallbackCatalogTest extends AnyFunSuite {
     // Multi-part namespace (Snowflake: database.schema.table)
     assert(catalog.buildFullTableName(
       Identifier.of(Array("production_db", "analytics_schema"), "sales_table"), None) ===
-      "production_db.analytics_schema.sales_table")
+      name("production_db.analytics_schema.sales_table"))
     // Single-part namespace (Snowflake: schema.table)
     assert(catalog.buildFullTableName(
       Identifier.of(Array("analytics_schema"), "sales_table"), None) ===
-      "analytics_schema.sales_table")
+      name("analytics_schema.sales_table"))
     // No namespace (Snowflake: table only)
     assert(catalog.buildFullTableName(Identifier.of(Array(), "sales_table"), None) ===
-      "sales_table")
+      name("sales_table"))
     // Deep multi-part namespace (e.g., catalog.database.schema.table)
     assert(catalog.buildFullTableName(
       Identifier.of(Array("catalog", "production_db", "analytics_schema"), "sales_table"),
-      None) === "catalog.production_db.analytics_schema.sales_table")
-    // Special characters are preserved as-is
-    assert(catalog.buildFullTableName(
-      Identifier.of(Array("my_db", "my-schema"), "my.table"), None) ===
-      "my_db.my-schema.my.table")
+      None) === name("catalog.production_db.analytics_schema.sales_table"))
+    // Special characters are kept, each part quoted as a Snowflake identifier
+    val special = catalog.buildFullTableName(Identifier.of(Array("my_db", "my-schema"), "my.table"), None)
+    assert(special === SnowflakeTableName(Seq("my_db", "my-schema", "my.table")))
+    assert(special.sql === "\"MY_DB\".\"my-schema\".\"my.table\"")
   }
 
   // Hardening: a runtime SQLConf value (what a Spark-SQL `SET` writes) must NOT
@@ -254,7 +256,7 @@ class SnowflakeFallbackCatalogTest extends AnyFunSuite {
     withSpark() { _ =>
       val catalog = newCatalog("alias", "snowflake-database" -> "MY_DB_2")
       assert(catalog.buildFullTableName(Identifier.of(Array("MY_SCHEMA"), "MY_TABLE"),
-        catalog.resolveDatabase(None)) === "MY_DB_2.MY_SCHEMA.MY_TABLE")
+        catalog.resolveDatabase(None)) === name("MY_DB_2.MY_SCHEMA.MY_TABLE"))
       intercept[IllegalArgumentException] {
         catalog.buildFullTableName(Identifier.of(Array("A", "B"), "MY_TABLE"),
           catalog.resolveDatabase(None))
@@ -270,7 +272,7 @@ class SnowflakeFallbackCatalogTest extends AnyFunSuite {
     withSpark() { _ =>
       val catalog = newCatalog("alias", "snowflake-database" -> "  ", "warehouse" -> "MY_DB_1")
       assert(catalog.buildFullTableName(Identifier.of(Array("MY_SCHEMA"), "MY_TABLE"),
-        catalog.resolveDatabase(None)) === "MY_DB_1.MY_SCHEMA.MY_TABLE")
+        catalog.resolveDatabase(None)) === name("MY_DB_1.MY_SCHEMA.MY_TABLE"))
     }
   }
 
@@ -278,7 +280,7 @@ class SnowflakeFallbackCatalogTest extends AnyFunSuite {
     withSpark() { _ =>
       val catalog = newCatalog("MY_DB_1", "warehouse" -> "MY_DB_2")
       assert(catalog.buildFullTableName(Identifier.of(Array("MY_SCHEMA"), "MY_TABLE"),
-        catalog.resolveDatabase(None)) === "MY_DB_2.MY_SCHEMA.MY_TABLE")
+        catalog.resolveDatabase(None)) === name("MY_DB_2.MY_SCHEMA.MY_TABLE"))
       intercept[IllegalArgumentException] {
         catalog.buildFullTableName(Identifier.of(Array("A", "B"), "MY_TABLE"),
           catalog.resolveDatabase(None))
@@ -311,16 +313,16 @@ class SnowflakeFallbackCatalogTest extends AnyFunSuite {
       "spark.sql.catalog.cat3" -> impl,
       "spark.sql.catalog.cat3.warehouse" -> "MY_DB_2",
       "spark.sql.catalog.cat3.snowflake-database" -> "MY_DB_3")) { spark =>
-      def dbtable(name: String): String = {
+      def dbtable(name: String): SnowflakeTableName = {
         val catalog = spark.sessionState.catalogManager.catalog(name)
           .asInstanceOf[SnowflakeFallbackCatalog]
         catalog.buildFullTableName(Identifier.of(Array("MY_SCHEMA"), "MY_TABLE"),
           catalog.resolveDatabase(None))
       }
 
-      assert(dbtable("cat1") === "MY_DB_1.MY_SCHEMA.MY_TABLE")
-      assert(dbtable("cat2") === "MY_DB_2.MY_SCHEMA.MY_TABLE")
-      assert(dbtable("cat3") === "MY_DB_3.MY_SCHEMA.MY_TABLE")
+      assert(dbtable("cat1") === name("MY_DB_1.MY_SCHEMA.MY_TABLE"))
+      assert(dbtable("cat2") === name("MY_DB_2.MY_SCHEMA.MY_TABLE"))
+      assert(dbtable("cat3") === name("MY_DB_3.MY_SCHEMA.MY_TABLE"))
     }
   }
 
@@ -332,21 +334,21 @@ class SnowflakeFallbackCatalogTest extends AnyFunSuite {
       val catalog = newCatalog("alias",
         (catalogOptions + ("forbidden-tables" -> "MY_SCHEMA.MY_TABLE")).toSeq: _*)
       val table = fallbackTable(catalog.loadTable(Identifier.of(Array("MY_SCHEMA"), "MY_TABLE")))
-      table.params + ("dbtable" -> table.dbtable)
+      table.params + ("table" -> table.table.parts.mkString("."))
     }
 
     val defaulted = fallbackProps(Map.empty)
     assert(defaulted.get("sfdatabase").contains("MY_DB_2"))
-    assert(defaulted.get("dbtable").contains("MY_DB_2.MY_SCHEMA.MY_TABLE"))
+    assert(defaulted.get("table").contains("MY_DB_2.MY_SCHEMA.MY_TABLE"))
     val sessionSet = fallbackProps(Map("spark.snowflake.sfDatabase" -> "MY_DB_1"))
     assert(sessionSet.get("sfdatabase").contains("MY_DB_1"))
-    assert(sessionSet.get("dbtable").contains("MY_DB_2.MY_SCHEMA.MY_TABLE"))
+    assert(sessionSet.get("table").contains("MY_DB_2.MY_SCHEMA.MY_TABLE"))
     val fromWarehouse = fallbackProps(Map.empty, Map("warehouse" -> "MY_DB_3"))
     assert(fromWarehouse.get("sfdatabase").contains("MY_DB_3"))
-    assert(fromWarehouse.get("dbtable").contains("MY_DB_3.MY_SCHEMA.MY_TABLE"))
+    assert(fromWarehouse.get("table").contains("MY_DB_3.MY_SCHEMA.MY_TABLE"))
     val sessionOverWarehouse = fallbackProps(
       Map("spark.snowflake.sfDatabase" -> "MY_DB_1"), Map("warehouse" -> "MY_DB_3"))
     assert(sessionOverWarehouse.get("sfdatabase").contains("MY_DB_1"))
-    assert(sessionOverWarehouse.get("dbtable").contains("MY_SCHEMA.MY_TABLE"))
+    assert(sessionOverWarehouse.get("table").contains("MY_SCHEMA.MY_TABLE"))
   }
 }

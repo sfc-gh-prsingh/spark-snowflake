@@ -34,6 +34,25 @@ import org.slf4j.LoggerFactory
 import IcebergTimeTravel.{Branch, Main, Spec}
 
 /**
+ * A Snowflake table name from the parts of a Spark identifier. Each part becomes a Snowflake
+ * identifier on its own (Utils.ensureQuoted): a plain name as Snowflake resolves it unquoted, in
+ * upper case, a part already quoted as is, and anything else quoted exactly, so no part can
+ * change the SQL it is placed in.
+ */
+private[catalog] final case class SnowflakeTableName(parts: Seq[String]) {
+  require(parts.nonEmpty, "A table name has at least one part")
+
+  def sql: String = parts.map(Utils.ensureQuoted).mkString(".")
+
+  /** INFORMATION_SCHEMA of the table's database; the session's when the name has none. */
+  def informationSchema: String =
+    if (parts.length == 3) s"${Utils.ensureQuoted(parts.head)}.INFORMATION_SCHEMA"
+    else "INFORMATION_SCHEMA"
+
+  override def toString: String = sql
+}
+
+/**
  * A table SnowflakeFallbackCatalog reads and writes through Snowflake after Horizon returns 403
  * for it, so Snowflake applies the table's policies. Reads honor Iceberg's time travel read
  * options and spark.wap.branch; writes go to main only.
@@ -42,16 +61,16 @@ import IcebergTimeTravel.{Branch, Main, Spec}
  * Spark's V1 relation cache, which would ignore them.
  *
  * @param params   Snowflake connection parameters, without dbtable or query
- * @param dbtable  the table in Snowflake
+ * @param table    the table in Snowflake
  * @param spec     what the catalog loaded: the current table, or a version of it
  * @param loadRefs reads the table's refs (name -> type); by default from Snowflake
  */
 private[catalog] class SnowflakeFallbackTable(
     tableName: String,
     val params: Map[String, String],
-    val dbtable: String,
+    val table: SnowflakeTableName,
     val spec: Spec,
-    loadRefs: (Map[String, String], String) => Map[String, String] =
+    loadRefs: (Map[String, String], SnowflakeTableName) => Map[String, String] =
       SnowflakeFallbackTable.queryRefs)
   extends Table with SupportsRead with SupportsWrite {
 
@@ -60,7 +79,7 @@ private[catalog] class SnowflakeFallbackTable(
   private def spark: SparkSession = SparkSession.active
 
   // At most one refs query per loaded table, and only for spark.wap.branch or VERSION AS OF
-  private lazy val refs: Try[Map[String, String]] = Try(loadRefs(params, dbtable))
+  private lazy val refs: Try[Map[String, String]] = Try(loadRefs(params, table))
 
   /**
    * What a read with these options reads: a time travel option, else (as Iceberg) the
@@ -74,7 +93,7 @@ private[catalog] class SnowflakeFallbackTable(
             case Success(types) => types
             case Failure(e) =>
               throw new IllegalStateException(
-                s"Cannot read the refs of $dbtable to apply spark.wap.branch=$wap; unset " +
+                s"Cannot read the refs of $table to apply spark.wap.branch=$wap; unset " +
                   "spark.wap.branch to read the main branch", e)
           }
           if (known.get(wap).contains("BRANCH")) Branch(wap) else Main
@@ -82,14 +101,14 @@ private[catalog] class SnowflakeFallbackTable(
       case requested =>
         IcebergTimeTravel.resolve(requested, refs.getOrElse {
           // Unresolved, VERSION_REF still reads a refreshed branch or a tag
-          log.warn(s"Cannot read the refs of $dbtable; reading VERSION AS OF with VERSION_REF")
+          log.warn(s"Cannot read the refs of $table; reading VERSION AS OF with VERSION_REF")
           Map.empty
         })
     }
 
   /** Connector parameters for reading or writing at `at`; other options pass through. */
   private def relationParams(options: Map[String, String], at: Spec): Map[String, String] =
-    params ++ IcebergTimeTravel.withoutReadOptions(options) ++ at.readParameters(dbtable)
+    params ++ IcebergTimeTravel.withoutReadOptions(options) ++ at.readParameters(table)
 
   private def relation(parameters: Map[String, String]): SnowflakeRelation =
     new DefaultSource().createRelation(spark.sqlContext, parameters) match {
@@ -131,7 +150,7 @@ private[catalog] class SnowflakeFallbackTable(
       }
     }
 
-  override def toString: String = s"SnowflakeFallbackTable($tableName, $dbtable, $spec)"
+  override def toString: String = s"SnowflakeFallbackTable($tableName, $table, $spec)"
 }
 
 private[catalog] object SnowflakeFallbackTable {
@@ -141,8 +160,8 @@ private[catalog] object SnowflakeFallbackTable {
   private val log = LoggerFactory.getLogger(classOf[SnowflakeFallbackTable])
 
   /** The table's refs from GET_TABLE_VERSION_REFS, as name -> type (BRANCH or TAG). */
-  def queryRefs(params: Map[String, String], dbtable: String): Map[String, String] = {
-    val rows = Utils.runQuery(params, IcebergTimeTravel.refTypesQuery(dbtable))
+  def queryRefs(params: Map[String, String], table: SnowflakeTableName): Map[String, String] = {
+    val rows = Utils.runQuery(params, IcebergTimeTravel.refTypesQuery(table))
     Iterator.continually(rows).takeWhile(_.next())
       .map(r => r.getString(1) -> r.getString(2).toUpperCase(Locale.ROOT)).toMap
   }

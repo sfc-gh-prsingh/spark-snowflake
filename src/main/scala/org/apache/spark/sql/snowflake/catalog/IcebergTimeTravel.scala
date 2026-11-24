@@ -34,18 +34,18 @@ private[catalog] object IcebergTimeTravel {
   /** What a read of a fallback table reads: the current table, or a version of it. */
   sealed trait Spec {
     def clause: String
-    def query(dbtable: String): String = s"SELECT * FROM $dbtable $clause"
-    /** Connector parameters that read `dbtable` at this spec. */
-    def readParameters(dbtable: String): Map[String, String] =
-      Map(Parameters.PARAM_SF_QUERY -> query(dbtable))
+    def query(table: SnowflakeTableName): String = s"SELECT * FROM ${table.sql} $clause"
+    /** Connector parameters that read `table` at this spec. */
+    def readParameters(table: SnowflakeTableName): Map[String, String] =
+      Map(Parameters.PARAM_SF_QUERY -> query(table))
   }
 
-  /** The table's current state (Iceberg's main), read from dbtable without an AT clause. */
+  /** The table's current state (Iceberg's main), read without an AT clause. */
   case object Main extends Spec {
     def clause: String = ""
-    override def query(dbtable: String): String = s"SELECT * FROM $dbtable"
-    override def readParameters(dbtable: String): Map[String, String] =
-      Map(Parameters.PARAM_SF_DBTABLE -> dbtable)
+    override def query(table: SnowflakeTableName): String = s"SELECT * FROM ${table.sql}"
+    override def readParameters(table: SnowflakeTableName): Map[String, String] =
+      Map(Parameters.PARAM_SF_DBTABLE -> table.sql)
   }
 
   final case class Snapshot(id: Long) extends Spec {
@@ -79,20 +79,15 @@ private[catalog] object IcebergTimeTravel {
   /** Iceberg's refs metadata table, from Snowflake's GET_TABLE_VERSION_REFS. */
   case object Refs extends Spec {
     def clause: String = "REFS"
-    override def query(dbtable: String): String = {
-      // The function resolves in a database's INFORMATION_SCHEMA; dbtable is unquoted
-      val parts = dbtable.split('.')
-      val infoSchema =
-        if (parts.length == 3) s"${parts(0)}.INFORMATION_SCHEMA" else "INFORMATION_SCHEMA"
+    override def query(table: SnowflakeTableName): String =
       """SELECT REFERENCE_NAME AS "name", REFERENCE_TYPE AS "type", VERSION_ID AS """ +
         """"snapshot_id", MAX_REFERENCE_AGE_IN_MS AS "max_reference_age_in_ms", """ +
         """MIN_SNAPSHOTS_TO_KEEP AS "min_snapshots_to_keep", MAX_SNAPSHOT_AGE_IN_MS AS """ +
-        s""""max_snapshot_age_in_ms" FROM TABLE($infoSchema.GET_TABLE_VERSION_REFS(""" +
-        s"""TABLE_NAME => '${quote(dbtable)}'))"""
-    }
+        s""""max_snapshot_age_in_ms" FROM TABLE(${table.informationSchema}.""" +
+        s"""GET_TABLE_VERSION_REFS(TABLE_NAME => '${quote(table.sql)}'))"""
     // Iceberg's refs columns are lowercase; the connector would otherwise quote them ("name")
-    override def readParameters(dbtable: String): Map[String, String] =
-      super.readParameters(dbtable) + (Parameters.PARAM_KEEP_COLUMN_CASE -> "on")
+    override def readParameters(table: SnowflakeTableName): Map[String, String] =
+      super.readParameters(table) + (Parameters.PARAM_KEEP_COLUMN_CASE -> "on")
   }
 
   /** Main for main (Snowflake rejects AT(VERSION_REF => 'main')); ref names are case-sensitive. */
@@ -162,11 +157,12 @@ private[catalog] object IcebergTimeTravel {
   def withoutReadOptions(options: Map[String, String]): Map[String, String] =
     options.filter { case (k, _) => !ReadOptions.contains(k.toLowerCase(Locale.ROOT)) }
 
-  private def quote(name: String): String = name.replace("'", "''")
+  /** A Snowflake string literal's content: a backslash escapes, so it is doubled too. */
+  private def quote(value: String): String = value.replace("\\", "\\\\").replace("'", "''")
 
   /** The table's refs as (name, type) rows. */
-  def refTypesQuery(dbtable: String): String =
-    s"""SELECT "name", "type" FROM (${Refs.query(dbtable)})"""
+  def refTypesQuery(table: SnowflakeTableName): String =
+    s"""SELECT "name", "type" FROM (${Refs.query(table)})"""
 
   /** spark.wap.branch, unless unset or main. */
   def wapBranch(conf: RuntimeConfig): Option[String] =

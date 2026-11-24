@@ -59,13 +59,15 @@ class SnowflakeFallbackCatalogTimeTravelTest extends AnyFunSuite with LocalSpark
 
   private val secret = Identifier.of(Array("db"), "secret")
 
+  private def name(dotted: String): SnowflakeTableName = SnowflakeTableName(dotted.split('.').toSeq)
+
   private def specOf(ident: Identifier, name: String = "fb"): Spec =
     fallbackTable(catalog(name).loadTable(ident)).spec
 
   test("plain load falls back to the current table") {
     val table = fallbackTable(catalog().loadTable(secret))
     assert(table.spec == Main)
-    assert(table.dbtable == "MYDB.db.secret")
+    assert(table.table == name("MYDB.db.secret"))
     assert(table.name() == "fb.db.secret")
   }
 
@@ -96,7 +98,7 @@ class SnowflakeFallbackCatalogTimeTravelTest extends AnyFunSuite with LocalSpark
 
   test("time travel without a warehouse uses the namespace as is") {
     val table = fallbackTable(catalog("fbnowh").loadTable(secret, "x"))
-    assert(table.dbtable == "db.secret")
+    assert(table.table == name("db.secret"))
     assert(table.spec == Named("x"))
   }
 
@@ -111,7 +113,7 @@ class SnowflakeFallbackCatalogTimeTravelTest extends AnyFunSuite with LocalSpark
     for ((name, spec) <- cases) {
       val table = fallbackTable(catalog().loadTable(Identifier.of(Array("db", "secret"), name)))
       assert(table.spec == spec, name)
-      assert(table.dbtable == "MYDB.db.secret", name)
+      assert(table.table == this.name("MYDB.db.secret"), name)
     }
   }
 
@@ -132,7 +134,7 @@ class SnowflakeFallbackCatalogTimeTravelTest extends AnyFunSuite with LocalSpark
     for ((name, dbtable) <- Seq("fb" -> "MYDB.db.secret", "fbnowh" -> "db.secret")) {
       val table = fallbackTable(catalog(name).loadTable(Identifier.of(Array("db", "secret"), "refs")))
       assert(table.spec == Refs, name)
-      assert(table.dbtable == dbtable, name)
+      assert(table.table == this.name(dbtable), name)
     }
   }
 
@@ -147,7 +149,7 @@ class SnowflakeFallbackCatalogTimeTravelTest extends AnyFunSuite with LocalSpark
     // db.history is a table, not the history of a table db
     val table = fallbackTable(catalog().loadTable(Identifier.of(Array("db"), "history")))
     assert(table.spec == Main)
-    assert(table.dbtable == "MYDB.db.history")
+    assert(table.table == name("MYDB.db.history"))
   }
 
   test("tableExists sees a protected table without reading it") {

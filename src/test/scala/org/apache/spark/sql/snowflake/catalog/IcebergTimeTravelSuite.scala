@@ -33,7 +33,9 @@ class IcebergTimeTravelSuite extends AnyFunSuite with LocalSparkSuite {
   override protected def configure(builder: SparkSession.Builder): SparkSession.Builder =
     builder.config("spark.sql.session.timeZone", "UTC")
 
-  private val dbtable = "MYDB.db.secret"
+  private val dbtable = SnowflakeTableName(Seq("MYDB", "db", "secret"))
+  // Each part a Snowflake identifier: plain names in upper case, as Snowflake resolves them
+  private val sql = "\"MYDB\".\"DB\".\"SECRET\""
   private val epochMillis = 1764547200000L
 
   private def read(options: (String, String)*): Spec = readSpec(Main, options.toMap)
@@ -53,15 +55,37 @@ class IcebergTimeTravelSuite extends AnyFunSuite with LocalSparkSuite {
       ("timestampAsOf" -> ts) -> s"AT(TIMESTAMP => TO_TIMESTAMP_LTZ($tsMicros, 6))")
     for ((option, clause) <- cases) {
       val params = read(option).readParameters(dbtable)
-      assert(params == Map("query" -> s"SELECT * FROM $dbtable $clause"), option)
+      assert(params == Map("query" -> s"SELECT * FROM $sql $clause"), option)
       assert(withoutReadOptions(Map(option, "other" -> "x")) == Map("other" -> "x"),
         s"$option must not reach JDBC")
     }
   }
 
   test("branch and tag names are quoted as Snowflake string literals") {
-    assert(Branch("it's").query(dbtable) == s"SELECT * FROM $dbtable AT(BRANCH => 'it''s')")
-    assert(Tag("it's").query(dbtable) == s"SELECT * FROM $dbtable AT(VERSION_REF => 'it''s')")
+    assert(Branch("it's").query(dbtable) == s"SELECT * FROM $sql AT(BRANCH => 'it''s')")
+    assert(Tag("it's").query(dbtable) == s"SELECT * FROM $sql AT(VERSION_REF => 'it''s')")
+    // A backslash escapes in a Snowflake string literal, so it can't end the literal early
+    assert(Tag("x\\").clause == "AT(VERSION_REF => 'x\\\\')")
+    assert(Branch("x\\'); DROP TABLE t; --").clause ==
+      "AT(BRANCH => 'x\\\\''); DROP TABLE t; --')")
+  }
+
+  test("table names are Snowflake identifiers, so a crafted name can't change the SQL") {
+    // Plain names stay case-insensitive, as when Snowflake resolves them unquoted
+    assert(SnowflakeTableName(Seq("my_db", "Schema", "t1")).sql == "\"MY_DB\".\"SCHEMA\".\"T1\"")
+    // A part already quoted, e.g. a database configured as "My DB", is kept as is
+    assert(SnowflakeTableName(Seq("\"My DB\"", "s", "t")).sql == "\"My DB\".\"S\".\"T\"")
+    // Anything else is quoted exactly, with its double quotes doubled
+    assert(SnowflakeTableName(Seq("my-schema", "my.table")).sql == "\"my-schema\".\"my.table\"")
+    val crafted = SnowflakeTableName(Seq("db", "t\" AT(VERSION => 1); DROP TABLE x; --"))
+    assert(crafted.sql == "\"DB\".\"t\"\" AT(VERSION => 1); DROP TABLE x; --\"")
+    assert(Main.readParameters(crafted) == Map("dbtable" -> crafted.sql))
+    // The database of the refs function is an identifier too, and the table name a literal
+    val db = SnowflakeTableName(Seq("d\".x", "s", "t'"))
+    assert(db.informationSchema == "\"d\"\".x\".INFORMATION_SCHEMA")
+    assert(Refs.query(db).endsWith(
+      "FROM TABLE(\"d\"\".x\".INFORMATION_SCHEMA.GET_TABLE_VERSION_REFS(" +
+        "TABLE_NAME => '\"d\"\".x\".\"S\".\"t''\"'))"))
   }
 
   test("VERSION AS OF picks a snapshot ID only for numeric versions, else a branch or tag") {
@@ -87,7 +111,7 @@ class IcebergTimeTravelSuite extends AnyFunSuite with LocalSparkSuite {
     for (option <- Seq("branch" -> "main", "versionAsOf" -> "main")) {
       assert(read(option) == Main, option)
     }
-    assert(Main.readParameters(dbtable) == Map("dbtable" -> dbtable))
+    assert(Main.readParameters(dbtable) == Map("dbtable" -> sql))
   }
 
   test("a read without time travel options reads what the catalog loaded") {
@@ -116,11 +140,11 @@ class IcebergTimeTravelSuite extends AnyFunSuite with LocalSparkSuite {
       "SELECT REFERENCE_NAME AS \"name\", REFERENCE_TYPE AS \"type\", VERSION_ID AS " +
         "\"snapshot_id\", MAX_REFERENCE_AGE_IN_MS AS \"max_reference_age_in_ms\", " +
         "MIN_SNAPSHOTS_TO_KEEP AS \"min_snapshots_to_keep\", MAX_SNAPSHOT_AGE_IN_MS AS " +
-        "\"max_snapshot_age_in_ms\" FROM TABLE(MYDB.INFORMATION_SCHEMA.GET_TABLE_VERSION_REFS(" +
-        "TABLE_NAME => 'MYDB.db.secret'))")
-    // Without a database in dbtable, the function resolves in the session's database
-    assert(Refs.query("db.secret")
-      .endsWith("FROM TABLE(INFORMATION_SCHEMA.GET_TABLE_VERSION_REFS(TABLE_NAME => 'db.secret'))"))
+        "\"max_snapshot_age_in_ms\" FROM TABLE(\"MYDB\".INFORMATION_SCHEMA." +
+        "GET_TABLE_VERSION_REFS(TABLE_NAME => '\"MYDB\".\"DB\".\"SECRET\"'))")
+    // Without a database in the name, the function resolves in the session's database
+    assert(Refs.query(SnowflakeTableName(Seq("db", "secret"))).endsWith(
+      "FROM TABLE(INFORMATION_SCHEMA.GET_TABLE_VERSION_REFS(TABLE_NAME => '\"DB\".\"SECRET\"'))"))
     // Iceberg's lowercase column names, not "name"; other reads keep the connector's default
     assert(Refs.readParameters(dbtable).get("keep_column_case").contains("on"))
     assert(!Branch("x").readParameters(dbtable).contains("keep_column_case"))
@@ -191,13 +215,13 @@ class IcebergTimeTravelSuite extends AnyFunSuite with LocalSparkSuite {
   test("a time travel read sends the AT clause in the SELECT") {
     val rel = relation(stubbed().table.scanParameters(Map("snapshot-id" -> "123")))
     assert(paramsOf(rel).table.isEmpty)
-    assert(selectSql(rel) == s"""SELECT "ID" FROM (SELECT * FROM $dbtable AT(VERSION => 123))""")
+    assert(selectSql(rel) == s"""SELECT "ID" FROM (SELECT * FROM $sql AT(VERSION => 123))""")
     assert(!paramsOf(rel).sfExtraOptions.contains("snapshot-id"))
   }
 
   test("a read without options reads dbtable, and other read options reach the connector") {
     val params = stubbed().table.scanParameters(Map("partition_size_in_mb" -> "8"))
-    assert(params.get("dbtable").contains(dbtable))
+    assert(params.get("dbtable").contains(sql))
     assert(!params.contains("query"))
     assert(params.get("partition_size_in_mb").contains("8"))
     assert(params.get("sfdatabase").contains("MYDB"))
@@ -244,7 +268,7 @@ class IcebergTimeTravelSuite extends AnyFunSuite with LocalSparkSuite {
   }
 
   test("the V1 scan pushes columns and the filters Snowflake handles, as the V1 relation") {
-    val rel = relation(creds + ("dbtable" -> dbtable))
+    val rel = relation(creds + ("dbtable" -> sql))
     val builder = new SnowflakeFallbackTable.SnowflakeScanBuilder(rel)
     val filters: Array[Filter] = Array(EqualTo("id", 1))
     assert(builder.pushFilters(filters).toSeq == rel.unhandledFilters(filters).toSeq)

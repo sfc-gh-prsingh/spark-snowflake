@@ -70,7 +70,6 @@ class SnowflakeFallbackCatalog extends SparkCatalog {
   protected def configure(
       name: String, options: CaseInsensitiveStringMap): CaseInsensitiveStringMap = {
     this.catalogName = name
-    // Inserted unquoted into dbtable
     this.snowflakeDatabase =
       Option(options.get("snowflake-database")).map(_.trim).filter(_.nonEmpty)
     // Horizon IRC maps the Iceberg warehouse to the Snowflake database
@@ -228,35 +227,26 @@ class SnowflakeFallbackCatalog extends SparkCatalog {
     snowflakeDatabase.orElse(warehouse.filter(_ => sessionDatabase.isEmpty))
 
   /**
-   * Constructs the dbtable property value from a V2 Identifier.
-   * This converts multi-part namespaces into Snowflake's dot-separated format.
+   * The Snowflake table of a V2 Identifier: its namespace parts, then its name, each part a
+   * Snowflake identifier of its own (see SnowflakeTableName).
    *
    * Examples:
-   * - Identifier(["db", "schema"], "table") → "db.schema.table"
-   * - Identifier(["schema"], "table") → "schema.table"
-   * - Identifier([], "table") → "table"
-   * - with database "db", Identifier(["schema"], "table") -> "db.schema.table";
+   * - Identifier(["db", "schema"], "table") → db.schema.table
+   * - Identifier(["schema"], "table") → schema.table
+   * - Identifier([], "table") → table
+   * - with database "db", Identifier(["schema"], "table") -> db.schema.table;
    *   any other namespace length is rejected
    *
    * @param ident The V2 Identifier with namespace and table name
    * @param database The Snowflake database from resolveDatabase, if any
-   * @return The fully qualified table name for the dbtable property
    */
   private[snowflake] def buildFullTableName(
-      ident: Identifier, database: Option[String]): String = {
+      ident: Identifier, database: Option[String]): SnowflakeTableName = {
     require(database.isEmpty || ident.namespace().length == 1,
       s"Catalog '$catalogName' resolves Snowflake database '${database.get}', which requires " +
         s"a single-level namespace (schema.table), but got: $ident")
-    val namespace = if (ident.namespace().nonEmpty) {
-      Some((database.toSeq ++ ident.namespace()).mkString("."))
-    } else {
-      None
-    }
-
-    namespace match {
-      case Some(ns) => s"$ns.${ident.name()}"
-      case None => ident.name()
-    }
+    val namespace = if (ident.namespace().nonEmpty) database.toSeq ++ ident.namespace() else Nil
+    SnowflakeTableName(namespace :+ ident.name())
   }
 
   // Hardening: ONLY the immutable SparkConf feeds connector options. spark.conf and
@@ -277,7 +267,7 @@ class SnowflakeFallbackCatalog extends SparkCatalog {
     new SnowflakeFallbackTable(
       tableName = (catalogName +: ident.namespace() :+ ident.name()).mkString("."),
       params = database.map(Parameters.PARAM_SF_DATABASE -> _).toMap ++ snowflakeProps,
-      dbtable = buildFullTableName(ident, database),
+      table = buildFullTableName(ident, database),
       spec = spec)
   }
 
