@@ -15,15 +15,17 @@
  */
 package org.apache.spark.sql.snowflake.catalog
 
+import java.nio.file.Files
 import java.util.{List => JList, Map => JMap, Set => JSet}
 
 import org.apache.hadoop.conf.Configuration
-import org.apache.iceberg.{CatalogUtil, Schema, Table}
+import org.apache.iceberg.{CatalogUtil, MetadataTableType, Schema, Table}
 import org.apache.iceberg.catalog.{Catalog, Namespace, SupportsNamespaces, TableIdentifier}
 import org.apache.iceberg.exceptions.ForbiddenException
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 
 import scala.collection.JavaConverters._
+import scala.util.Try
 
 /**
  * Test-only SnowflakeFallbackCatalog whose Iceberg catalog simulates Horizon IRC denying access
@@ -44,7 +46,7 @@ class ForbiddingFallbackCatalog extends SnowflakeFallbackCatalog {
     def tables(key: String): Set[String] = Option(options.get(key)).toSeq
       .flatMap(_.split(",")).map(_.trim).filter(_.nonEmpty).toSet
     val warehouse = Option(options.get("hadoop-warehouse")).getOrElse(
-      java.nio.file.Files.createTempDirectory("forbidding-catalog").toUri.toString)
+      Files.createTempDirectory("forbidding-catalog").toUri.toString)
     val hadoop = CatalogUtil.buildIcebergCatalog(name,
       Map("type" -> "hadoop", "warehouse" -> warehouse).asJava, new Configuration())
     new ForbiddingCatalog(hadoop, hadoop.asInstanceOf[SupportsNamespaces],
@@ -59,7 +61,7 @@ class ForbiddingCatalog(
 
   // Horizon's REST client also 403s metadata tables (t.snapshots, t.refs) of a protected table
   private def isMetadataOfForbidden(ident: TableIdentifier): Boolean =
-    scala.util.Try(org.apache.iceberg.MetadataTableType.from(ident.name())).toOption
+    Try(MetadataTableType.from(ident.name())).toOption
       .exists(_ != null) && forbidden.contains(ident.namespace().toString)
   private def check(ident: TableIdentifier): Unit = {
     if (forbidden.contains(ident.toString) || isMetadataOfForbidden(ident)) {

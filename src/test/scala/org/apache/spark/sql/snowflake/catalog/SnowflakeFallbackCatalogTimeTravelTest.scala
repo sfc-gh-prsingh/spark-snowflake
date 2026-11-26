@@ -17,7 +17,7 @@ package org.apache.spark.sql.snowflake.catalog
 
 import java.nio.file.Files
 
-import org.apache.iceberg.exceptions.ForbiddenException
+import org.apache.iceberg.exceptions.{ForbiddenException, ValidationException}
 import org.apache.spark.sql.SparkSession
 import org.apache.spark.sql.catalyst.analysis.NoSuchTableException
 import org.apache.spark.sql.connector.catalog.{Identifier, SupportsRead, TableCatalog, V1Table}
@@ -124,7 +124,7 @@ class SnowflakeFallbackCatalogTimeTravelTest extends AnyFunSuite with LocalSpark
   }
 
   test("selector names of readable or missing tables keep the delegate's error") {
-    intercept[org.apache.iceberg.exceptions.ValidationException](
+    intercept[ValidationException](
       catalog().loadTable(Identifier.of(Array("db", "open"), "branch_missing")))
     intercept[NoSuchTableException](
       catalog().loadTable(Identifier.of(Array("db", "missing"), "branch_x")))

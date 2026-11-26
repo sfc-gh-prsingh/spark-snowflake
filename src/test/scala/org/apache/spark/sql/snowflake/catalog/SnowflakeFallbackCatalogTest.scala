@@ -17,14 +17,17 @@
 package org.apache.spark.sql.snowflake.catalog
 
 import java.nio.file.Files
+import java.util.Collections
 
+import net.snowflake.spark.snowflake.Utils
 import org.apache.iceberg.CatalogUtil
-import org.apache.iceberg.exceptions.ForbiddenException
+import org.apache.iceberg.exceptions.{ForbiddenException, NoSuchNamespaceException}
 import org.apache.iceberg.rest.RESTCatalog
 import org.apache.iceberg.spark.SparkCatalog
 import org.apache.iceberg.spark.source.SparkTable
 import org.apache.spark.SPARK_VERSION
 import org.apache.spark.sql.SparkSession
+import org.apache.spark.sql.catalyst.analysis.NoSuchTableException
 import org.apache.spark.sql.connector.catalog._
 import org.apache.spark.sql.snowflake.catalog.LocalSparkSuite.fallbackTable
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
@@ -82,9 +85,9 @@ class SnowflakeFallbackCatalogTest extends AnyFunSuite {
     // Names and IDs in messages contain 403 (db.t.snapshot_id_5010424037564433155, sales_403)
     assert(!forbidden(new RuntimeException("Some other error")))
     assert(!forbidden(new RuntimeException("HTTP 403 Forbidden")))
-    assert(!forbidden(new org.apache.spark.sql.catalyst.analysis.NoSuchTableException(
+    assert(!forbidden(new NoSuchTableException(
       Identifier.of(Array("db", "secret"), "snapshot_id_5010424037564433155"))))
-    assert(!forbidden(new org.apache.iceberg.exceptions.NoSuchNamespaceException(
+    assert(!forbidden(new NoSuchNamespaceException(
       "Namespace does not exist: sales_403")))
   }
 
@@ -187,7 +190,7 @@ class SnowflakeFallbackCatalogTest extends AnyFunSuite {
       val userAgent = options.get("header.User-Agent")
       assert(userAgent != null, "User-Agent header should be set")
       val expectedUserAgent =
-        s"spark-snowflake/${net.snowflake.spark.snowflake.Utils.VERSION} spark/${SPARK_VERSION}"
+        s"spark-snowflake/${Utils.VERSION} spark/${SPARK_VERSION}"
       assert(userAgent == expectedUserAgent, s"Expected '$expectedUserAgent', got '$userAgent'")
       val pattern = """spark-snowflake/\d+\.\d+\.\d+ spark/\d+\.\d+\.\d+""".r
       assert(pattern.findFirstIn(userAgent).isDefined,
@@ -202,7 +205,7 @@ class SnowflakeFallbackCatalogTest extends AnyFunSuite {
   test("namespace and table listing come from the Iceberg catalog") {
     withSpark() { _ =>
       val catalog = newCatalog("test")
-      catalog.createNamespace(Array("schema"), java.util.Collections.emptyMap())
+      catalog.createNamespace(Array("schema"), Collections.emptyMap())
       assert(catalog.listNamespaces().map(_.toSeq).toSeq == Seq(Seq("schema")))
       assert(catalog.listTables(Array("schema")).isEmpty)
     }

@@ -16,12 +16,13 @@
 package org.apache.spark.sql.snowflake.catalog
 
 import java.time.Instant
-import java.util.Locale
+import java.util.{Locale, Set => JSet}
 
 import scala.collection.JavaConverters._
 import scala.util.{Failure, Success, Try}
 
 import net.snowflake.spark.snowflake.{DefaultSource, Parameters, Utils}
+import net.snowflake.spark.snowflake.Parameters.{log => _, _}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{DataFrame, Row, SQLContext, SparkSession}
 import org.apache.spark.sql.connector.catalog.{SupportsRead, SupportsWrite, Table, TableCapability}
@@ -33,6 +34,7 @@ import org.apache.spark.sql.util.CaseInsensitiveStringMap
 import org.slf4j.LoggerFactory
 
 import IcebergTimeTravel.{Main, Snapshot, Spec, TimestampMicros}
+import SnowflakeFallbackTable._
 
 /**
  * A Snowflake table name from the parts of a Spark identifier. Each part becomes a Snowflake
@@ -78,8 +80,6 @@ private[catalog] class SnowflakeFallbackTable(
     loadSnapshotAsOf: (Map[String, String], SnowflakeTableName, Long) => Option[Long] =
       SnowflakeFallbackTable.querySnapshotAsOf)
   extends Table with SupportsRead with SupportsWrite {
-
-  import SnowflakeFallbackTable._
 
   private def spark: SparkSession = SparkSession.active
 
@@ -150,7 +150,7 @@ private[catalog] class SnowflakeFallbackTable(
 
   override def name(): String = tableName
   override def schema(): StructType = tableSchema
-  override def capabilities(): java.util.Set[TableCapability] = Set(
+  override def capabilities(): JSet[TableCapability] = Set(
     TableCapability.BATCH_READ, TableCapability.V1_BATCH_WRITE, TableCapability.TRUNCATE).asJava
 
   /** Connector parameters of a read with these options. */
@@ -190,8 +190,6 @@ private[catalog] object SnowflakeFallbackTable {
     BaseRelation with PrunedFilteredScan with InsertableRelation
 
   private val log = LoggerFactory.getLogger(classOf[SnowflakeFallbackTable])
-
-  import Parameters._
 
   /**
    * Options a read or write can't set: the table read or written, and the connection: endpoint,

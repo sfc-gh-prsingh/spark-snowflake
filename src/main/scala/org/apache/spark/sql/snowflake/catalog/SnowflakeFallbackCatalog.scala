@@ -17,7 +17,7 @@ package org.apache.spark.sql.snowflake.catalog
 
 import java.util.Locale
 
-import net.snowflake.spark.snowflake.Parameters
+import net.snowflake.spark.snowflake.{Parameters, Utils}
 import org.apache.iceberg.{CatalogUtil, MetadataTableType}
 import org.apache.iceberg.catalog.Catalog
 import org.apache.iceberg.exceptions.ForbiddenException
@@ -33,6 +33,7 @@ import scala.collection.JavaConverters._
 import scala.util.Try
 
 import IcebergTimeTravel.{Main, Refs, Spec}
+import SnowflakeFallbackCatalog._
 
 private object SnowflakeFallbackCatalog {
   // Iceberg SparkCatalog's snapshot selectors in the table name; its own patterns are private
@@ -51,8 +52,6 @@ private object SnowflakeFallbackCatalog {
  * IcebergSparkSessionExtensions, like SparkCatalog.
  */
 class SnowflakeFallbackCatalog extends SparkCatalog {
-
-  import SnowflakeFallbackCatalog._
 
   private val log = LoggerFactory.getLogger(getClass)
   private var catalogName: String = _
@@ -80,7 +79,7 @@ class SnowflakeFallbackCatalog extends SparkCatalog {
     // Format: spark-snowflake/<connector-version> spark/<spark-version>; header.User-Agent works
     // with all Iceberg versions
     val userAgent =
-      s"spark-snowflake/${net.snowflake.spark.snowflake.Utils.VERSION} spark/$SPARK_VERSION"
+      s"spark-snowflake/${Utils.VERSION} spark/$SPARK_VERSION"
     // Iceberg defaults to type=hive; Horizon IRC is a REST catalog
     val catalogImplOrType = Option(options.get("catalog-impl"))
       .flatMap(icebergCatalogImpl(name, _)).map("catalog-impl" -> _)
