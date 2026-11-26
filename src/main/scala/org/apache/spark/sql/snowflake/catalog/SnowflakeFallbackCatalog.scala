@@ -18,7 +18,7 @@ package org.apache.spark.sql.snowflake.catalog
 import java.util.Locale
 
 import net.snowflake.spark.snowflake.Parameters
-import org.apache.iceberg.MetadataTableType
+import org.apache.iceberg.{CatalogUtil, MetadataTableType}
 import org.apache.iceberg.catalog.Catalog
 import org.apache.iceberg.exceptions.ForbiddenException
 import org.apache.iceberg.spark.SparkCatalog
@@ -64,8 +64,9 @@ class SnowflakeFallbackCatalog extends SparkCatalog {
     super.buildIcebergCatalog(name, configure(name, options))
 
   /**
-   * Reads this catalog's own options and returns the options for Iceberg: without them, and
-   * with the spark-snowflake User-Agent for Horizon.
+   * Reads this catalog's own options and returns the options for Iceberg: without them, with
+   * type=rest (Horizon IRC) unless type or an Iceberg catalog-impl is set, and with the
+   * spark-snowflake User-Agent for Horizon.
    */
   protected def configure(
       name: String, options: CaseInsensitiveStringMap): CaseInsensitiveStringMap = {
@@ -80,11 +81,15 @@ class SnowflakeFallbackCatalog extends SparkCatalog {
     // with all Iceberg versions
     val userAgent =
       s"spark-snowflake/${net.snowflake.spark.snowflake.Utils.VERSION} spark/$SPARK_VERSION"
+    // Iceberg defaults to type=hive; Horizon IRC is a REST catalog
+    val catalogImplOrType = Option(options.get("catalog-impl"))
+      .flatMap(icebergCatalogImpl(name, _)).map("catalog-impl" -> _)
+      .orElse(Some(CatalogUtil.ICEBERG_CATALOG_TYPE -> CatalogUtil.ICEBERG_CATALOG_TYPE_REST)
+        .filterNot(_ => options.containsKey(CatalogUtil.ICEBERG_CATALOG_TYPE)))
     val icebergOptions = options.asScala
       .filterKeys(key => !SnowflakeOptions.contains(key.toLowerCase(Locale.ROOT)))
       .toMap ++
-      Option(options.get("catalog-impl")).flatMap(icebergCatalogImpl(name, _))
-        .map("catalog-impl" -> _) +
+      catalogImplOrType +
       ("header.User-Agent" -> userAgent)
     new CaseInsensitiveStringMap(icebergOptions.asJava)
   }
@@ -103,9 +108,9 @@ class SnowflakeFallbackCatalog extends SparkCatalog {
       case Some(c) if classOf[CatalogPlugin].isAssignableFrom(c) =>
         throw new IllegalArgumentException(
           s"Catalog '$name': SnowflakeFallbackCatalog no longer delegates to a Spark catalog " +
-            s"(catalog-impl=$impl); it is an Iceberg SparkCatalog. Remove catalog-impl and " +
-            "configure the Iceberg catalog with type (e.g. type=rest), or set catalog-impl to " +
-            "an Iceberg Catalog class")
+            s"(catalog-impl=$impl); it is an Iceberg SparkCatalog. Remove catalog-impl (the " +
+            "Iceberg catalog type defaults to rest), or set catalog-impl to an Iceberg Catalog " +
+            "class")
       case _ => Some(impl)
     }
 

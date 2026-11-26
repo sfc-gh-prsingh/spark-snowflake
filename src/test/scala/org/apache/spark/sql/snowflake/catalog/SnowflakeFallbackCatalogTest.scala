@@ -18,7 +18,9 @@ package org.apache.spark.sql.snowflake.catalog
 
 import java.nio.file.Files
 
+import org.apache.iceberg.CatalogUtil
 import org.apache.iceberg.exceptions.ForbiddenException
+import org.apache.iceberg.rest.RESTCatalog
 import org.apache.iceberg.spark.SparkCatalog
 import org.apache.iceberg.spark.source.SparkTable
 import org.apache.spark.SPARK_VERSION
@@ -158,6 +160,19 @@ class SnowflakeFallbackCatalogTest extends AnyFunSuite {
       for (impl <- Seq("org.apache.iceberg.rest.RESTCatalog", "com.example.NotOnClasspath")) {
         assert(newCatalog("test", "catalog-impl" -> impl).icebergOptions.get("catalog-impl") == impl)
       }
+    }
+  }
+
+  test("type defaults to rest unless type or an Iceberg catalog-impl is set") {
+    withSpark() { _ =>
+      def catalogType(options: (String, String)*): String =
+        newCatalog("test", options: _*).icebergOptions.get(CatalogUtil.ICEBERG_CATALOG_TYPE)
+      val rest = CatalogUtil.ICEBERG_CATALOG_TYPE_REST
+      assert(catalogType() == rest)
+      // The old config, with only catalog-impl=SparkCatalog, gets Horizon's REST catalog too
+      assert(catalogType("catalog-impl" -> classOf[SparkCatalog].getName) == rest)
+      assert(catalogType("TYPE" -> "hadoop") == "hadoop")
+      assert(catalogType("catalog-impl" -> classOf[RESTCatalog].getName) == null)
     }
   }
 
