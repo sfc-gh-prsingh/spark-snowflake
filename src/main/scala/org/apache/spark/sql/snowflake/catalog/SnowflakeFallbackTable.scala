@@ -15,10 +15,11 @@
  */
 package org.apache.spark.sql.snowflake.catalog
 
+import java.time.Instant
 import java.util.Locale
 
 import scala.collection.JavaConverters._
-import scala.util.Try
+import scala.util.{Failure, Success, Try}
 
 import net.snowflake.spark.snowflake.{DefaultSource, Parameters, Utils}
 import org.apache.spark.rdd.RDD
@@ -31,7 +32,7 @@ import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 import org.slf4j.LoggerFactory
 
-import IcebergTimeTravel.{Main, Spec}
+import IcebergTimeTravel.{Main, Snapshot, Spec, TimestampMicros}
 
 /**
  * A Snowflake table name from the parts of a Spark identifier. Each part becomes a Snowflake
@@ -64,6 +65,8 @@ private[catalog] final case class SnowflakeTableName(parts: Seq[String]) {
  * @param table    the table in Snowflake
  * @param spec     what the catalog loaded: the current table, or a version of it
  * @param loadRefs reads the table's refs (name -> type); by default from Snowflake
+ * @param loadSnapshotAsOf reads the snapshot TIMESTAMP AS OF (microseconds) reads, if any; by
+ *                         default from Snowflake
  */
 private[catalog] class SnowflakeFallbackTable(
     tableName: String,
@@ -71,7 +74,9 @@ private[catalog] class SnowflakeFallbackTable(
     val table: SnowflakeTableName,
     val spec: Spec,
     loadRefs: (Map[String, String], SnowflakeTableName) => Map[String, String] =
-      SnowflakeFallbackTable.queryRefs)
+      SnowflakeFallbackTable.queryRefs,
+    loadSnapshotAsOf: (Map[String, String], SnowflakeTableName, Long) => Option[Long] =
+      SnowflakeFallbackTable.querySnapshotAsOf)
   extends Table with SupportsRead with SupportsWrite {
 
   import SnowflakeFallbackTable._
@@ -91,7 +96,25 @@ private[catalog] class SnowflakeFallbackTable(
       // Unresolved, VERSION_REF still reads a refreshed branch or a tag
       log.warn(s"Cannot read the refs of $table; reading VERSION AS OF with VERSION_REF")
       Map.empty
-    })
+    }) match {
+      case TimestampMicros(micros) => snapshotAsOf(micros)
+      case other => other
+    }
+
+  /** TIMESTAMP AS OF as the snapshot Iceberg reads (see IcebergTimeTravel.snapshotAsOfQuery). */
+  private def snapshotAsOf(micros: Long): Spec =
+    Try(loadSnapshotAsOf(params, table, micros)) match {
+      case Success(Some(id)) => Snapshot(id)
+      case Success(None) =>
+        // As Iceberg
+        val time = Instant.ofEpochMilli(Math.floorDiv(micros, 1000L))
+        throw new IllegalArgumentException(s"Cannot find a snapshot older than $time")
+      case Failure(e) =>
+        // Unresolved, AT(TIMESTAMP) reads by Snowflake's commit time, a few seconds later
+        log.warn(s"Cannot read the snapshot history of $table; reading TIMESTAMP AS OF with " +
+          s"AT(TIMESTAMP): ${e.getMessage}")
+        TimestampMicros(micros)
+    }
 
   /**
    * The options of a read or write that the connector receives: its own options, except time
@@ -199,6 +222,13 @@ private[catalog] object SnowflakeFallbackTable {
     val rows = Utils.runQuery(params, IcebergTimeTravel.refTypesQuery(table))
     Iterator.continually(rows).takeWhile(_.next())
       .map(r => r.getString(1) -> r.getString(2).toUpperCase(Locale.ROOT)).toMap
+  }
+
+  /** The snapshot TIMESTAMP AS OF (microseconds) reads, from ICEBERG_TABLE_HISTORY. */
+  def querySnapshotAsOf(
+      params: Map[String, String], table: SnowflakeTableName, micros: Long): Option[Long] = {
+    val rows = Utils.runQuery(params, IcebergTimeTravel.snapshotAsOfQuery(table, micros))
+    if (rows.next()) Some(rows.getLong(1)) else None
   }
 
   /** A V1 scan of the Snowflake relation: filters and columns are pushed into its query. */

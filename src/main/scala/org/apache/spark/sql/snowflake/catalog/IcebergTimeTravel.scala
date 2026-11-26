@@ -164,6 +164,17 @@ private[catalog] object IcebergTimeTravel {
   def refTypesQuery(table: SnowflakeTableName): String =
     s"""SELECT "name", "type" FROM (${Refs.query(table)})"""
 
+  /**
+   * The snapshot TIMESTAMP AS OF reads, as Iceberg picks it (SnapshotUtil.snapshotIdAsOfTime):
+   * the last snapshot-log entry at or before the time, in milliseconds. Snowflake's AT(TIMESTAMP)
+   * uses the time Snowflake committed a version instead, which is later than the Iceberg
+   * snapshot's timestamp, so near a commit it reads the version before.
+   */
+  def snapshotAsOfQuery(table: SnowflakeTableName, micros: Long): String =
+    s"SELECT SNAPSHOT_ID FROM TABLE(${table.informationSchema}.ICEBERG_TABLE_HISTORY(" +
+      s"TABLE_NAME => '${quote(table.sql)}')) WHERE MADE_CURRENT_AT <= " +
+      s"TO_TIMESTAMP_LTZ(${Math.floorDiv(micros, 1000L)}, 3) ORDER BY MADE_CURRENT_AT DESC LIMIT 1"
+
   /** spark.wap.branch, unless unset or main. */
   def wapBranch(conf: RuntimeConfig): Option[String] =
     conf.getOption(SparkSQLProperties.WAP_BRANCH)

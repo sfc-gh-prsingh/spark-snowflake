@@ -187,11 +187,17 @@ class IcebergTimeTravelSuite extends AnyFunSuite with LocalSparkSuite {
     try f finally spark.conf.unset(kv._1)
   }
 
-  /** A fallback table whose refs come from `refs` instead of Snowflake; counts the lookups. */
-  private class StubbedTable(spec: Spec, refs: => Map[String, String]) {
+  /**
+   * A fallback table whose refs and TIMESTAMP AS OF snapshots come from `refs` and `asOf` instead
+   * of Snowflake; counts the lookups of each.
+   */
+  private class StubbedTable(
+      spec: Spec, refs: => Map[String, String], asOf: Long => Option[Long] = _ => None) {
     var lookups = 0
+    var asOfLookups = Seq.empty[Long]
     val table = new SnowflakeFallbackTable("fb.db.secret", creds + ("sfdatabase" -> "MYDB"),
-      dbtable, spec, (_, _) => { lookups += 1; refs })
+      dbtable, spec, (_, _) => { lookups += 1; refs },
+      (_, _, micros) => { asOfLookups :+= micros; asOf(micros) })
   }
 
   private def stubbed(spec: Spec = Main, refs: Map[String, String] = Map.empty) =
@@ -258,6 +264,41 @@ class IcebergTimeTravelSuite extends AnyFunSuite with LocalSparkSuite {
     def failing(spec: Spec) = new StubbedTable(spec, throw new RuntimeException("no privilege"))
     assert(failing(Named("dev")).table.readSpec(Map.empty) == Tag("dev"))
     withConf("spark.wap.branch" -> "dev")(assert(failing(Main).table.readSpec(Map.empty) == Main))
+  }
+
+  test("TIMESTAMP AS OF reads the snapshot Iceberg picks from the history, by version") {
+    val micros = epochMillis * 1000L + 999L
+    val t = new StubbedTable(TimestampMicros(micros), Map.empty, _ => Some(42L))
+    assert(t.table.readSpec(Map.empty) == Snapshot(42L))
+    assert(t.asOfLookups == Seq(micros))
+    assert(t.table.scanParameters(Map.empty).get("query")
+      .contains(s"SELECT * FROM $sql AT(VERSION => 42)"))
+    // The read options too, and no lookup for other reads
+    val u = new StubbedTable(Main, Map.empty, _ => Some(7L))
+    assert(u.table.readSpec(Map("as-of-timestamp" -> epochMillis.toString)) == Snapshot(7L))
+    assert(u.table.readSpec(Map("snapshot-id" -> "1")) == Snapshot(1L))
+    assert(u.table.readSpec(Map.empty) == Main)
+    assert(u.asOfLookups == Seq(epochMillis * 1000L))
+  }
+
+  test("TIMESTAMP AS OF before the first snapshot fails, as in Iceberg") {
+    val t = new StubbedTable(TimestampMicros(epochMillis * 1000L), Map.empty, _ => None)
+    val e = intercept[IllegalArgumentException](t.table.readSpec(Map.empty))
+    assert(e.getMessage == "Cannot find a snapshot older than 2025-12-01T00:00:00Z")
+  }
+
+  test("a failed history lookup reads TIMESTAMP AS OF with AT(TIMESTAMP)") {
+    val micros = epochMillis * 1000L
+    val t = new StubbedTable(TimestampMicros(micros), Map.empty,
+      _ => throw new RuntimeException("Unknown function ICEBERG_TABLE_HISTORY"))
+    assert(t.table.readSpec(Map.empty) == TimestampMicros(micros))
+  }
+
+  test("the TIMESTAMP AS OF lookup reads the snapshot log in milliseconds") {
+    assert(snapshotAsOfQuery(dbtable, epochMillis * 1000L + 999L) ==
+      "SELECT SNAPSHOT_ID FROM TABLE(\"MYDB\".INFORMATION_SCHEMA.ICEBERG_TABLE_HISTORY(" +
+        "TABLE_NAME => '\"MYDB\".\"DB\".\"SECRET\"')) WHERE MADE_CURRENT_AT <= " +
+        s"TO_TIMESTAMP_LTZ($epochMillis, 3) ORDER BY MADE_CURRENT_AT DESC LIMIT 1")
   }
 
   test("connection, table and unknown options of a read or write are ignored") {
