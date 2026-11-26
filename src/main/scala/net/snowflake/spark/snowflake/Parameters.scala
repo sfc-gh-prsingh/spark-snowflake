@@ -45,6 +45,9 @@ object Parameters {
     param
   }
 
+  /** Whether the connector itself reads `param` (lowercase); it passes any other to JDBC. */
+  def isKnownParameter(param: String): Boolean = KNOWN_PARAMETERS.contains(param)
+
   // List of known parameters
   val PARAM_S3_MAX_FILE_SIZE: String = knownParam("s3maxfilesize")
   val PARAM_SF_ACCOUNT: String = knownParam("sfaccount")

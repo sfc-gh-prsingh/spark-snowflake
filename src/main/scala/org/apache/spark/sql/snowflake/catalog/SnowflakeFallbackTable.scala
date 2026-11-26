@@ -18,9 +18,9 @@ package org.apache.spark.sql.snowflake.catalog
 import java.util.Locale
 
 import scala.collection.JavaConverters._
-import scala.util.{Failure, Success, Try}
+import scala.util.Try
 
-import net.snowflake.spark.snowflake.{DefaultSource, Utils}
+import net.snowflake.spark.snowflake.{DefaultSource, Parameters, Utils}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{DataFrame, Row, SQLContext, SparkSession}
 import org.apache.spark.sql.connector.catalog.{SupportsRead, SupportsWrite, Table, TableCapability}
@@ -31,7 +31,7 @@ import org.apache.spark.sql.types.StructType
 import org.apache.spark.sql.util.CaseInsensitiveStringMap
 import org.slf4j.LoggerFactory
 
-import IcebergTimeTravel.{Branch, Main, Spec}
+import IcebergTimeTravel.{Main, Spec}
 
 /**
  * A Snowflake table name from the parts of a Spark identifier. Each part becomes a Snowflake
@@ -55,7 +55,7 @@ private[catalog] final case class SnowflakeTableName(parts: Seq[String]) {
 /**
  * A table SnowflakeFallbackCatalog reads and writes through Snowflake after Horizon returns 403
  * for it, so Snowflake applies the table's policies. Reads honor Iceberg's time travel read
- * options and spark.wap.branch; writes go to main only.
+ * options; writes go to main only.
  *
  * Each read builds its Snowflake relation from its own options: as a V2 table it is not in
  * Spark's V1 relation cache, which would ignore them.
@@ -78,37 +78,42 @@ private[catalog] class SnowflakeFallbackTable(
 
   private def spark: SparkSession = SparkSession.active
 
-  // At most one refs query per loaded table, and only for spark.wap.branch or VERSION AS OF
+  // At most one refs query per loaded table, and only for VERSION AS OF '<name>'
   private lazy val refs: Try[Map[String, String]] = Try(loadRefs(params, table))
 
   /**
-   * What a read with these options reads: a time travel option, else (as Iceberg) the
-   * spark.wap.branch branch once it exists, and VERSION AS OF '<name>' as a branch or tag.
+   * What a read with these options reads: a time travel option, else the table as loaded, with
+   * VERSION AS OF '<name>' as a branch or tag. spark.wap.branch is not read: Iceberg reads it only
+   * from a table with write.wap.enabled=true, which the 403 hides, and which is off by default.
    */
   private[catalog] def readSpec(options: Map[String, String]): Spec =
-    IcebergTimeTravel.readSpec(spec, options) match {
-      case Main =>
-        IcebergTimeTravel.wapBranch(spark.conf).fold[Spec](Main) { wap =>
-          val known = refs match {
-            case Success(types) => types
-            case Failure(e) =>
-              throw new IllegalStateException(
-                s"Cannot read the refs of $table to apply spark.wap.branch=$wap; unset " +
-                  "spark.wap.branch to read the main branch", e)
-          }
-          if (known.get(wap).contains("BRANCH")) Branch(wap) else Main
-        }
-      case requested =>
-        IcebergTimeTravel.resolve(requested, refs.getOrElse {
-          // Unresolved, VERSION_REF still reads a refreshed branch or a tag
-          log.warn(s"Cannot read the refs of $table; reading VERSION AS OF with VERSION_REF")
-          Map.empty
-        })
-    }
+    IcebergTimeTravel.resolve(IcebergTimeTravel.readSpec(spec, options), refs.getOrElse {
+      // Unresolved, VERSION_REF still reads a refreshed branch or a tag
+      log.warn(s"Cannot read the refs of $table; reading VERSION AS OF with VERSION_REF")
+      Map.empty
+    })
 
-  /** Connector parameters for reading or writing at `at`; other options pass through. */
+  /**
+   * The options of a read or write that the connector receives: its own options, except time
+   * travel, table and connection ones. Connection settings come only from SparkConf (see
+   * SnowflakeFallbackCatalog), so an option cannot send them to another server or change the
+   * identity or role; any option the connector doesn't know would reach JDBC.
+   */
+  private[catalog] def connectorOptions(options: Map[String, String]): Map[String, String] = {
+    val (kept, ignored) = IcebergTimeTravel.withoutReadOptions(options)
+      .map { case (k, v) => k.toLowerCase(Locale.ROOT) -> v }
+      .partition { case (k, _) => Parameters.isKnownParameter(k) && !ProtectedOptions(k) }
+    if (ignored.nonEmpty) {
+      log.warn(s"Ignoring options ${ignored.keys.toSeq.sorted.mkString(", ")} of $table: a " +
+        "policy-protected table takes its connection settings from SparkConf, and only " +
+        "spark-snowflake read and write options")
+    }
+    kept
+  }
+
+  /** Connector parameters for reading or writing at `at`. */
   private def relationParams(options: Map[String, String], at: Spec): Map[String, String] =
-    params ++ IcebergTimeTravel.withoutReadOptions(options) ++ at.readParameters(table)
+    params ++ connectorOptions(options) ++ at.readParameters(table)
 
   private def relation(parameters: Map[String, String]): SnowflakeRelation =
     new DefaultSource().createRelation(spark.sqlContext, parameters) match {
@@ -132,19 +137,23 @@ private[catalog] class SnowflakeFallbackTable(
   override def newScanBuilder(options: CaseInsensitiveStringMap): ScanBuilder =
     new SnowflakeScanBuilder(relation(scanParameters(options.asCaseSensitiveMap().asScala.toMap)))
 
+  /** Connector parameters of a write with these options: to main, overwriting in place. */
+  private[catalog] def writeParams(options: Map[String, String]): Map[String, String] =
+    relationParams(options, Main) ++ InPlaceOverwrite
+
   override def newWriteBuilder(info: LogicalWriteInfo): WriteBuilder =
     new WriteBuilder with SupportsTruncate {
       private var truncating = false
       override def truncate(): WriteBuilder = { truncating = true; this }
       override def build(): V1Write = new V1Write {
         override def toInsertableRelation: InsertableRelation = new InsertableRelation {
-          // Spark's V1 fallback always passes overwrite = false; truncate() carries INSERT OVERWRITE
+          // Spark's V1 fallback always passes overwrite = false; truncate() marks INSERT OVERWRITE
           override def insert(data: DataFrame, overwrite: Boolean): Unit = {
             val conf = spark.conf
             IcebergTimeTravel.checkWrite(
               spec, IcebergTimeTravel.wapBranch(conf), IcebergTimeTravel.wapId(conf))
             val writeOptions = info.options().asCaseSensitiveMap().asScala.toMap
-            relation(relationParams(writeOptions, Main)).insert(data, truncating || overwrite)
+            relation(writeParams(writeOptions)).insert(data, truncating || overwrite)
           }
         }
       }
@@ -158,6 +167,32 @@ private[catalog] object SnowflakeFallbackTable {
     BaseRelation with PrunedFilteredScan with InsertableRelation
 
   private val log = LoggerFactory.getLogger(classOf[SnowflakeFallbackTable])
+
+  import Parameters._
+
+  /**
+   * Options a read or write can't set: the table read or written, and the connection: endpoint,
+   * transport, identity and its credentials, role, the database and schema a name resolves in, a
+   * registered connection, and SQL run before or after with the connection's role.
+   */
+  private val ProtectedOptions = Set(
+    PARAM_SF_DBTABLE, PARAM_SF_QUERY,
+    PARAM_SF_URL, PARAM_SF_ACCOUNT, PARAM_SF_SSL, PARAM_USE_PROXY, PARAM_PROXY_PROTOCOL,
+    PARAM_PROXY_HOST, PARAM_PROXY_PORT, PARAM_PROXY_USER, PARAM_PROXY_PASSWORD,
+    PARAM_NON_PROXY_HOSTS,
+    PARAM_SF_USER, PARAM_SF_PASSWORD, PARAM_PEM_PRIVATE_KEY, PARAM_AUTHENTICATOR,
+    PARAM_OAUTH_TOKEN, PARAM_WORKLOAD_IDENTITY_PROVIDER, PARAM_OAUTH_CLIENT_ID,
+    PARAM_OAUTH_CLIENT_SECRET, PARAM_OAUTH_TOKEN_REQUEST_URL, PARAM_OAUTH_SCOPE,
+    PARAM_SF_ROLE, PARAM_SF_DATABASE, PARAM_SF_SCHEMA, PARAM_CONNECTION_ID,
+    PARAM_PREACTIONS, PARAM_POSTACTIONS)
+
+  /**
+   * An overwrite truncates the table and loads it again. The connector's default loads a new
+   * regular table and swaps it in, and without a staging table it drops the table: either way the
+   * Iceberg table and its policies would be replaced.
+   */
+  private val InPlaceOverwrite =
+    Map(PARAM_USE_STAGING_TABLE -> "off", PARAM_TRUNCATE_TABLE -> "on")
 
   /** The table's refs from GET_TABLE_VERSION_REFS, as name -> type (BRANCH or TAG). */
   def queryRefs(params: Map[String, String], table: SnowflakeTableName): Map[String, String] = {

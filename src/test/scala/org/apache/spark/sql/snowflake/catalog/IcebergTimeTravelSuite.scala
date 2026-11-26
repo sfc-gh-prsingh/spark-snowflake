@@ -227,16 +227,12 @@ class IcebergTimeTravelSuite extends AnyFunSuite with LocalSparkSuite {
     assert(params.get("sfdatabase").contains("MYDB"))
   }
 
-  test("with spark.wap.branch set, a plain read reads the WAP branch once it exists") {
+  test("spark.wap.branch doesn't change a read, as for Iceberg without write.wap.enabled") {
     withConf("spark.wap.branch" -> "dev") {
       val t = stubbed(refs = Map("dev" -> "BRANCH"))
-      assert(t.table.readSpec(Map.empty) == Branch("dev"))
-      assert(t.table.readSpec(Map.empty) == Branch("dev"))
-      // One refs query per loaded table, not per read
-      assert(t.lookups == 1)
-      // A tag of that name is not the WAP branch
-      assert(stubbed(refs = Map("dev" -> "TAG")).table.readSpec(Map.empty) == Main)
-      assert(stubbed().table.readSpec(Map.empty) == Main)
+      assert(t.table.readSpec(Map.empty) == Main)
+      assert(t.table.scanParameters(Map.empty).get("dbtable").contains(sql))
+      assert(t.lookups == 0)
     }
   }
 
@@ -258,13 +254,40 @@ class IcebergTimeTravelSuite extends AnyFunSuite with LocalSparkSuite {
     assert(stubbed(Named("v1"), Map("v1" -> "TAG")).table.readSpec(Map.empty) == Tag("v1"))
   }
 
-  test("a failed refs lookup fails a WAP read clearly, but VERSION AS OF falls back to VERSION_REF") {
+  test("a failed refs lookup reads VERSION AS OF '<name>' with VERSION_REF") {
     def failing(spec: Spec) = new StubbedTable(spec, throw new RuntimeException("no privilege"))
-    withConf("spark.wap.branch" -> "dev") {
-      val e = intercept[IllegalStateException](failing(Main).table.readSpec(Map.empty))
-      assert(e.getMessage.contains("spark.wap.branch=dev") && e.getCause.getMessage == "no privilege")
-    }
     assert(failing(Named("dev")).table.readSpec(Map.empty) == Tag("dev"))
+    withConf("spark.wap.branch" -> "dev")(assert(failing(Main).table.readSpec(Map.empty) == Main))
+  }
+
+  test("connection, table and unknown options of a read or write are ignored") {
+    val t = stubbed().table
+    val options = Map("sfURL" -> "evil.example.com:443", "sfRole" -> "ACCOUNTADMIN",
+      "sfUser" -> "other", "sfAuthenticator" -> "externalbrowser", "proxy_host" -> "evil",
+      "sfDatabase" -> "OTHER", "connection_id" -> "c1", "preactions" -> "USE ROLE ACCOUNTADMIN",
+      "query" -> "SELECT * FROM OTHER.T", "dbtable" -> "OTHER.T",
+      // Unknown to the connector, so it would reach JDBC as a connection property
+      "role" -> "ACCOUNTADMIN",
+      "Partition_Size_In_MB" -> "8")
+    for (params <- Seq(t.scanParameters(options), t.writeParams(options))) {
+      assert((params -- creds.keys - "sfdatabase" - "dbtable" - "usestagingtable" -
+        "truncate_table") == Map("partition_size_in_mb" -> "8"))
+      assert(creds.forall { case (k, v) => params.get(k).contains(v) })
+      assert(params.get("sfdatabase").contains("MYDB"))
+      assert(params.get("dbtable").contains(sql))
+    }
+    // None of them reaches JDBC as a connection property
+    val jdbcProperties = paramsOf(relation(t.scanParameters(options))).sfExtraOptions.keySet
+    assert(jdbcProperties.intersect(options.keySet.map(_.toLowerCase)).isEmpty)
+  }
+
+  test("a write overwrites in place, so the Iceberg table and its policies stay") {
+    val params = stubbed().table.writeParams(Map("usestagingtable" -> "on",
+      "TRUNCATE_TABLE" -> "off"))
+    assert(params.get("usestagingtable").contains("off"))
+    assert(params.get("truncate_table").contains("on"))
+    val merged = Parameters.mergeParameters(params)
+    assert(!merged.useStagingTable && merged.truncateTable)
   }
 
   test("the V1 scan pushes columns and the filters Snowflake handles, as the V1 relation") {
